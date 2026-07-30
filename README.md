@@ -247,24 +247,7 @@ All fundamental and technical data is sourced from **TradingView** via the `tvki
 
 ## Requirements
 
-```
-tvkit>=1.0.0
-yfinance>=0.2.0
-pandas>=2.0
-numpy>=1.24
-matplotlib>=3.7
-seaborn>=0.12
-jinja2>=3.1
-python-dotenv>=1.0
-requests>=2.31
-beautifulsoup4>=4.12
-openpyxl>=3.1
-certifi>=2023.0
-pytesseract>=0.3
-pdf2image>=1.16
-weasyprint>=60.0    # Optional: for PDF output
-schedule>=1.2       # Optional: for scheduler
-```
+See [`requirements.txt`](requirements.txt) for the full, authoritative list of pinned Python dependencies.
 
 ### System dependencies (macOS)
 

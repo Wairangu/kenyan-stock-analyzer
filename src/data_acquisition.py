@@ -482,8 +482,6 @@ class DataAcquisition:
             'Stanbic': 'SBIC',
             'I&M Group': 'IMH',
             'I&M': 'IMH',
-            'I&M Group': 'IMH',
-            'I&M': 'IMH',
             'IMH': 'IMH',
             'I and M': 'IMH',
             'Kenya Power': 'KPLC',
