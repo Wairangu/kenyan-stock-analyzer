@@ -45,3 +45,13 @@ logs/
 # PDF/Excel output
 *.pdf
 *.xlsx
+
+# Terraform (state may contain resource details; never commit it).
+# Note: .terraform.lock.hcl is intentionally NOT ignored -- it pins
+# provider versions and should be committed for reproducible applies.
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/terraform.tfvars
+terraform/crash.log

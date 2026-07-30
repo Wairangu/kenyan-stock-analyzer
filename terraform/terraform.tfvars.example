@@ -1,0 +1,17 @@
+# Copy this file to terraform.tfvars (gitignored) and fill in your real
+# values. terraform.tfvars is never committed -- it's the one place PII
+# like an email address is allowed to live for this deployment.
+
+ses_sender    = "you@example.com"
+ses_recipient = "you@example.com"
+
+# Only needed if either address above is NOT already a verified SES
+# identity in your account:
+# ses_sender_already_verified    = false
+# ses_recipient_already_verified = false
+
+# Only needed if ses_sender is an address under a DOMAIN-verified SES
+# identity (e.g. sender is "alerts@yourdomain.com" but the verified SES
+# identity is just "yourdomain.com") -- leave blank/unset for a plain
+# email-address-verified identity.
+# ses_sender_identity = "yourdomain.com"

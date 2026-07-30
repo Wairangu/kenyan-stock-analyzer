@@ -283,7 +283,10 @@ def main():
             try:
                 from email_notifier import EmailNotifier
                 notifier = EmailNotifier(config)
-                body = notifier.generate_email_body(analysis_results, sector_data, breadth)
+                body = notifier.generate_email_body(
+                    analysis_results, sector_data, breadth,
+                    fundamentals_data=fundamentals_data, scores=scores,
+                )
                 notifier.send_report(
                     f"NSE Daily Report — {analysis_date.strftime('%Y-%m-%d')}",
                     body,

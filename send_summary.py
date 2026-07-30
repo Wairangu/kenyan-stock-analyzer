@@ -192,7 +192,10 @@ def main():
 
     from email_notifier import EmailNotifier
     notifier = EmailNotifier(config)
-    body = notifier.generate_email_body(analysis_results, sector_data, breadth)
+    body = notifier.generate_email_body(
+        analysis_results, sector_data, breadth,
+        fundamentals_data=fundamentals_data, scores=scores,
+    )
     attachments = [pdf_path] if pdf_path else []
     if ics_path and os.path.exists(ics_path):
         attachments.append(ics_path)

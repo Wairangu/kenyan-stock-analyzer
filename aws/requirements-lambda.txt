@@ -1,0 +1,23 @@
+# Trimmed dependency set for the Lambda deployment.
+#
+# Excluded on purpose (already safely optional in the app code, or unused):
+#   weasyprint, openpyxl, pdfplumber, pytesseract, pdf2image, schedule
+#     -> report_generator.py wraps weasyprint/openpyxl in try/except ImportError;
+#        pytesseract/pdf2image are only imported lazily when 'nse_pdf' is in
+#        DATA_SOURCES, which the Lambda config excludes.
+#   scipy
+#     -> never imported anywhere in the codebase (verified via grep).
+#   boto3 / botocore
+#     -> already bundled in the AWS Lambda Python base image.
+tvkit>=0.11.2
+yfinance>=1.5.1
+pandas>=3.0.0
+numpy>=2.5.0
+python-dotenv>=1.2.0
+matplotlib>=3.11.0
+seaborn>=0.13.0
+jinja2>=3.1.0
+beautifulsoup4>=4.15.0
+requests>=2.34.0
+rich>=15.0.0
+holidays>=0.50

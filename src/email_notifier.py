@@ -13,6 +13,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime
 from logger import get_logger
+from fundamental_analysis import FundamentalAnalysis
 
 logger = get_logger(__name__)
 
@@ -122,14 +123,31 @@ class EmailNotifier:
             return False
 
     def generate_email_body(self, analysis_results, sector_data=None,
-                            breadth=None):
+                            breadth=None, dashboard_url=None,
+                            fundamentals_data=None, scores=None):
         """
         Generate a compact HTML email body with market summary.
+
+        Visually matches the dashboard's look and feel -- same color
+        palette (bullish/bearish greens & reds, navy/teal/amber header
+        gradient) as templates/base.html -- kept to email-client-safe CSS
+        (no CSS custom properties, animations, or backdrop-filter, since
+        those aren't reliably supported by mail clients).
 
         Args:
             analysis_results: dict from AnalysisEngine.
             sector_data: dict from SectorAnalyzer.
             breadth: dict from AnalysisEngine.calculate_market_breadth.
+            dashboard_url: optional URL to the full hosted dashboard.
+                Shown as a button under the header and linked in the
+                footer. Omitted entirely when not provided (e.g. local
+                runs with no hosted dashboard).
+            fundamentals_data: dict from FundamentalAnalysis.fetch_all_fundamentals(),
+                used for the TradingView Buy/Sell signal column. Stocks
+                render as "N/A" for that column when omitted.
+            scores: dict from scoring.score_stock() per symbol, used for
+                the Score column. Stocks render "—" for that column when
+                omitted.
 
         Returns:
             HTML string suitable for email clients.
@@ -147,44 +165,123 @@ class EmailNotifier:
             if r and r.get('signals', {}).get('overall') == 'bearish'
         )
 
-        # Top gainers/losers
-        changes = []
-        for sym, r in analysis_results.items():
-            if r and r.get('daily_change_pct') is not None:
-                changes.append((sym, r['daily_change_pct']))
-        changes.sort(key=lambda x: x[1], reverse=True)
-        top_gainers = changes[:3]
-        top_losers = changes[-3:][::-1] if len(changes) >= 3 else []
+        # All stocks — signal & score (same fields/order as the dashboard's
+        # Overview table)
+        stocks = []
+        for symbol, r in sorted(analysis_results.items()):
+            if not r:
+                continue
+            latest = r.get('latest', {})
+            fund = (fundamentals_data or {}).get(symbol, {})
+            tv_label, tv_class = FundamentalAnalysis.signal_from_tech_rating(
+                fund.get('tech_rating')
+            )
+            stocks.append({
+                'symbol': symbol,
+                'price': latest.get('close'),
+                'change': r.get('daily_change_pct'),
+                'tv_label': tv_label,
+                'tv_class': tv_class,
+                'score': (scores or {}).get(symbol, {}).get('overall'),
+            })
+
+        dashboard_button = ""
+        if dashboard_url:
+            dashboard_button = f"""
+        <a href="{dashboard_url}" style="display:inline-block; margin-top:16px; padding:11px 22px; background-color:#ffffff; color:#0f172a; font-weight:700; font-size:0.85rem; text-decoration:none; border-radius:999px;">
+            📊 View Full Dashboard &rarr;
+        </a>"""
 
         # Build HTML
         html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; color: #1e293b; padding: 20px; }}
-        h1 {{ color: #1e293b; font-size: 1.3rem; }}
-        h2 {{ font-size: 1.1rem; margin-top: 20px; border-bottom: 2px solid #3b82f6; display: inline-block; }}
-        .header {{ background: linear-gradient(135deg, #1e293b, #334155); color: white; padding: 20px; border-radius: 8px; text-align: center; }}
-        .header h1 {{ color: white; }}
-        .stats {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }}
-        .stat {{ background: #f1f5f9; padding: 12px 16px; border-radius: 8px; text-align: center; flex: 1; min-width: 100px; }}
-        .stat .big {{ font-size: 1.5rem; font-weight: 700; color: #3b82f6; }}
-        .stat .label {{ font-size: 0.75rem; color: #64748b; text-transform: uppercase; }}
-        .bullish {{ color: #22c55e; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #f5f7fb;
+            color: #172033;
+            margin: 0;
+            padding: 20px;
+        }}
+        .container {{ max-width: 640px; margin: 0 auto; }}
+        h1 {{ margin: 0 0 6px; font-size: 1.5rem; font-weight: 800; }}
+        h2 {{
+            font-size: 1rem;
+            font-weight: 800;
+            margin: 0 0 14px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #2563eb;
+            display: inline-block;
+        }}
+        .header {{
+            text-align: center;
+            background-color: #0f172a;
+            background-image: linear-gradient(135deg, #0f172a 0%, #115e59 55%, #b45309 100%);
+            color: #ffffff;
+            padding: 30px 20px;
+            border-radius: 18px;
+            margin-bottom: 20px;
+        }}
+        .header h1 {{ color: #ffffff; }}
+        .header .meta {{ color: rgba(255,255,255,0.78); font-size: 0.88rem; margin: 0; }}
+        .card {{
+            background-color: #ffffff;
+            border: 1px solid rgba(148,163,184,0.28);
+            border-radius: 16px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+        }}
+        .bar {{
+            height: 3px;
+            background-color: #2563eb;
+            background-image: linear-gradient(90deg, #2563eb, #0f766e, #f59e0b);
+            border-radius: 3px;
+            margin: -18px -20px 16px;
+        }}
+        .stats {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .stat {{
+            background-color: #f5f7fb;
+            padding: 12px 14px;
+            border-radius: 12px;
+            text-align: center;
+            flex: 1;
+            min-width: 100px;
+            border: 1px solid rgba(148,163,184,0.22);
+        }}
+        .stat .big {{ font-size: 1.4rem; font-weight: 800; color: #2563eb; }}
+        .stat .label {{ font-size: 0.68rem; color: #667085; text-transform: uppercase; font-weight: 700; margin-top: 2px; }}
+        .bullish {{ color: #12b981; }}
         .bearish {{ color: #ef4444; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; margin: 8px 0; }}
-        th, td {{ padding: 8px 10px; text-align: left; border-bottom: 1px solid #e2e8f0; }}
-        th {{ background: #f8fafc; color: #64748b; font-size: 0.75rem; text-transform: uppercase; }}
-        .footer {{ margin-top: 24px; padding-top: 12px; border-top: 1px solid #e2e8f0; font-size: 0.75rem; color: #94a3b8; text-align: center; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
+        th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid rgba(148,163,184,0.28); }}
+        th {{ background-color: #f5f7fb; color: #667085; font-size: 0.68rem; text-transform: uppercase; font-weight: 800; }}
+        td strong {{ color: #0f172a; }}
+        .badge {{ display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; }}
+        .badge.strong_buy {{ background-color: #16a34a; color: #ffffff; }}
+        .badge.buy {{ background-color: #d1fae5; color: #065f46; }}
+        .badge.neutral {{ background-color: #fef3c7; color: #92400e; }}
+        .badge.sell {{ background-color: #fee2e2; color: #991b1b; }}
+        .badge.strong_sell {{ background-color: #dc2626; color: #ffffff; }}
+        .badge.undefined {{ background-color: #f1f5f9; color: #64748b; }}
+        .score {{ display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 0.78rem; font-weight: 800; }}
+        .score-high {{ background-color: #d1fae5; color: #065f46; }}
+        .score-mid {{ background-color: #fef3c7; color: #92400e; }}
+        .score-low {{ background-color: #fee2e2; color: #991b1b; }}
+        .footer {{ text-align: center; padding: 16px 8px 4px; font-size: 0.78rem; color: #667085; }}
+        .footer a {{ color: #2563eb; font-weight: 700; text-decoration: none; }}
     </style>
 </head>
 <body>
+    <div class="container">
     <div class="header">
-        <h1>NSE Daily Market Report</h1>
-        <p>{now}</p>
+        <h1>🇰🇪 NSE Daily Market Report</h1>
+        <p class="meta">{now}</p>{dashboard_button}
     </div>
 
+    <div class="card"><div class="bar"></div>
     <div class="stats">
         <div class="stat">
             <div class="big">{total}</div>
@@ -203,10 +300,12 @@ class EmailNotifier:
             <div class="label">Sectors</div>
         </div>
     </div>
+    </div>
 """
         # Market breadth
         if breadth:
             html += """
+    <div class="card"><div class="bar"></div>
     <h2>Market Breadth</h2>
     <div class="stats">
 """
@@ -221,28 +320,40 @@ class EmailNotifier:
             <div class="big">{breadth[key]}%</div>
             <div class="label">{label}</div>
         </div>"""
-            html += "\n    </div>\n"
+            html += "\n    </div>\n    </div>\n"
 
-        # Top gainers/losers
-        if top_gainers or top_losers:
+        # All stocks — signal & score
+        if stocks:
             html += """
-    <h2>Top Movers</h2>
+    <div class="card"><div class="bar"></div>
+    <h2>📋 All Stocks — Signal &amp; Score</h2>
     <table>
-        <tr><th>Symbol</th><th>Change</th><th>Direction</th></tr>
+        <tr><th>Symbol</th><th>TV Signal</th><th>Price</th><th>Change</th><th>Score</th></tr>
 """
-            for sym, chg in top_gainers + top_losers:
-                direction = "▲" if chg > 0 else "▼"
-                cls = "bullish" if chg > 0 else "bearish"
+            for s in stocks:
+                price_str = f"{s['price']:.2f}" if s['price'] is not None else '—'
+                chg = s['change']
+                chg_cls = 'bullish' if (chg or 0) >= 0 else 'bearish'
+                chg_str = f"{chg:+.2f}%" if chg is not None else '—'
+                sc = s['score']
+                if sc is None:
+                    score_html = '—'
+                else:
+                    sc_cls = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
+                    score_html = f'<span class="score {sc_cls}">{sc}</span>'
                 html += (
-                    f'        <tr><td>{sym}</td>'
-                    f'<td class="{cls}">{chg:+.2f}%</td>'
-                    f'<td class="{cls}">{direction}</td></tr>\n'
+                    f'        <tr><td><strong>{s["symbol"]}</strong></td>'
+                    f'<td><span class="badge {s["tv_class"]}">{s["tv_label"]}</span></td>'
+                    f'<td>{price_str}</td>'
+                    f'<td class="{chg_cls}">{chg_str}</td>'
+                    f'<td>{score_html}</td></tr>\n'
                 )
-            html += "    </table>\n"
+            html += "    </table>\n    </div>\n"
 
         # Sector performance
         if sector_data:
             html += """
+    <div class="card"><div class="bar"></div>
     <h2>Sector Performance</h2>
     <table>
         <tr><th>Sector</th><th>Stocks</th><th>Avg Change</th><th>Bullish %</th></tr>
@@ -250,17 +361,22 @@ class EmailNotifier:
             for name, data in sector_data.items():
                 cls = "bullish" if data['avg_change_pct'] >= 0 else "bearish"
                 html += (
-                    f'        <tr><td>{name}</td>'
+                    f'        <tr><td><strong>{name}</strong></td>'
                     f'<td>{data["count"]}</td>'
                     f'<td class="{cls}">{data["avg_change_pct"]:+.2f}%</td>'
                     f'<td>{data["bullish_ratio"]}%</td></tr>\n'
                 )
-            html += "    </table>\n"
+            html += "    </table>\n    </div>\n"
 
+        footer_link = (
+            f'<a href="{dashboard_url}">View the full dashboard &rarr;</a><br>'
+            if dashboard_url else ''
+        )
         html += f"""
     <div class="footer">
-        Generated by Kenyan Stock Analyzer — {now}<br>
-        For full reports, check the reports directory.
+        {footer_link}
+        Generated by Kenyan Stock Analyzer &mdash; {now}
+    </div>
     </div>
 </body>
 </html>"""
