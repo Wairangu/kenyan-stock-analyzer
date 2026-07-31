@@ -75,15 +75,3 @@ variable "lambda_timeout_seconds" {
   type        = number
   default     = 420
 }
-
-variable "portfolio_username" {
-  description = "Login username for the portfolio tracker at portfolio.getkitters.com. No default -- must be set in terraform.tfvars (gitignored), there's no safe placeholder for a credential."
-  type        = string
-  sensitive   = true
-}
-
-variable "portfolio_password_hash" {
-  description = "PBKDF2-HMAC-SHA256 password hash for the portfolio tracker, as salt_hex$hash_hex -- never the plaintext password. Generate locally with: python3 -c \"import os,hashlib; s=os.urandom(16); print(s.hex()+'$'+hashlib.pbkdf2_hmac('sha256', b'YOUR_PASSWORD', s, 200000).hex())\". Set the result in terraform.tfvars (gitignored)."
-  type        = string
-  sensitive   = true
-}

@@ -1,17 +1,18 @@
 # Password-protected personal trade journal at portfolio.getkitters.com.
 #
-# Separate from the public stocks.getkitters.com dashboard: trades.json
-# holds genuinely sensitive personal financial data, so this bucket is
-# fully private (Lambda-IAM-only access, never public/CloudFront-served
-# as static content) and the app itself is gated by a login form + signed
-# session cookie. Reuses data.aws_route53_zone.getkitters already
-# declared in cloudfront.tf -- do not redeclare it here.
+# Separate from the public stocks.getkitters.com dashboard: user account
+# and trade data is genuinely sensitive, so this bucket is fully private
+# (Lambda-IAM-only access, never public/CloudFront-served as static
+# content) and the app itself is gated by a login form + signed session
+# cookie -- registration is open (anyone can create an account), but
+# account data stays isolated per user. Reuses data.aws_route53_zone.getkitters
+# already declared in cloudfront.tf -- do not redeclare it here.
 #
 # The Lambda needs zero third-party pip dependencies: it reads current
 # prices from the existing dashboard's public prices.json instead of
 # calling TradingView itself, so it's a plain zip deploy (no ECR/Docker).
 
-# ---- Private S3 bucket for trades.json ----
+# ---- Private S3 bucket for users.json and trades/<username>.json ----
 
 resource "aws_s3_bucket" "portfolio_trades" {
   bucket = "kenyan-stock-portfolio-trades-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
@@ -44,36 +45,11 @@ resource "random_password" "portfolio_origin_secret" {
   special = false # kept alphanumeric -- this value travels as a raw HTTP header
 }
 
-resource "aws_ssm_parameter" "portfolio_username" {
-  name  = "/kenyan-stock-portfolio/username"
-  type  = "SecureString"
-  value = var.portfolio_username
-}
-
-resource "aws_ssm_parameter" "portfolio_password_hash" {
-  name  = "/kenyan-stock-portfolio/password_hash"
-  type  = "SecureString"
-  value = var.portfolio_password_hash
-
-  # The Lambda rewrites this at runtime when the user changes their
-  # password (see portfolio/lambda_handler.py's _set_password) -- once
-  # created, Terraform must never overwrite that with the original
-  # bootstrap value on a later apply.
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
-resource "aws_ssm_parameter" "portfolio_must_change_password" {
-  name  = "/kenyan-stock-portfolio/must_change_password"
-  type  = "String"
-  value = "true" # forces a password change on first login of a fresh/reset credential
-
-  lifecycle {
-    ignore_changes = [value] # the Lambda flips this to "false" once the user sets a new password
-  }
-}
-
+# Credentials for self-registered accounts live in users.json in
+# aws_s3_bucket.portfolio_trades (see portfolio/lambda_handler.py) --
+# SSM Parameter Store's fixed-name-per-parameter model doesn't extend to
+# an arbitrary number of users, so only the shared session-signing secret
+# stays here.
 resource "aws_ssm_parameter" "portfolio_session_secret" {
   name  = "/kenyan-stock-portfolio/session_secret"
   type  = "SecureString"
@@ -105,28 +81,19 @@ resource "aws_iam_role_policy" "portfolio_lambda_exec" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadWriteTrades"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = "${aws_s3_bucket.portfolio_trades.arn}/trades.json"
+        Sid    = "ReadWriteTrades"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject"]
+        Resource = [
+          "${aws_s3_bucket.portfolio_trades.arn}/trades/*",
+          "${aws_s3_bucket.portfolio_trades.arn}/users.json",
+        ]
       },
       {
         Sid      = "ReadSecrets"
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/kenyan-stock-portfolio/*"
-      },
-      {
-        # Scoped to only the two parameters the app is allowed to rewrite
-        # at runtime (a user changing their own password) -- username and
-        # session_secret stay Terraform-only/read-only to this role.
-        Sid    = "UpdateOwnCredentialState"
-        Effect = "Allow"
-        Action = ["ssm:PutParameter"]
-        Resource = [
-          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/kenyan-stock-portfolio/password_hash",
-          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/kenyan-stock-portfolio/must_change_password",
-        ]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/kenyan-stock-portfolio/session_secret"
       },
       {
         Sid    = "WriteLogs"
@@ -164,7 +131,8 @@ resource "aws_lambda_function" "portfolio" {
   environment {
     variables = {
       TRADES_BUCKET        = aws_s3_bucket.portfolio_trades.id
-      TRADES_KEY           = "trades.json"
+      TRADES_PREFIX        = "trades/"
+      USERS_KEY            = "users.json"
       PRICES_URL           = "https://stocks.getkitters.com/prices.json"
       SSM_PREFIX           = "/kenyan-stock-portfolio"
       ORIGIN_VERIFY_SECRET = random_password.portfolio_origin_secret.result

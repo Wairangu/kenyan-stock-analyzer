@@ -1,5 +1,9 @@
 """
-Portfolio tracker Lambda: password-protected personal trade journal.
+Portfolio tracker Lambda: password-protected, multi-user personal trade
+journal. Registration is open -- anyone who reaches the app can create an
+account (see the Context/security notes in terraform/portfolio.tf's plan
+history for that tradeoff). Each user's credentials and trade history are
+fully isolated from every other user's.
 
 Zero third-party dependencies (stdlib + boto3 only -- boto3 is preinstalled
 in the Lambda Python runtime). Current prices come from the existing
@@ -11,23 +15,32 @@ deploy, no container image.
 Routes (Lambda Function URL, API-Gateway-v2-style event payload):
   GET  /login              -- login form
   POST /login               -- verify credentials, set session cookie, redirect
+  GET  /register            -- account-creation form
+  POST /register             -- create an account, log straight in, redirect
   GET  /                    -- portfolio (holdings + trade history), requires session
-  POST /trades               -- add a buy/sell trade, requires session
+  POST /trades               -- add a buy/sell/dividend entry, requires session
   POST /trades/{id}/delete   -- remove a trade, requires session
   GET  /change-password      -- change-password form, requires session
-  POST /change-password       -- set a new password hash, requires session
+  POST /change-password       -- set a new password, requires session
   GET|POST /logout          -- clear session, redirect to /login
 
-If the stored must_change_password flag is set (true for a freshly
-bootstrapped credential -- see terraform/portfolio.tf), every route except
-/change-password and /logout redirects there until a new password is set,
-so the Terraform-provisioned bootstrap password is never the long-term one.
+Credentials and account metadata live in users.json in the private S3
+bucket (not SSM -- SSM Parameter Store's fixed-name-per-parameter model
+doesn't extend to an arbitrary number of self-registered users); each
+user's trades live in their own trades/<username>.json. A freshly
+self-registered account never needs a forced password change (the user
+picked their own password at signup) -- must_change_password only applies
+to the original Terraform-bootstrapped credential, migrated into
+users.json the same way.
 
-Access control is two-layered: the Function URL itself uses AWS_IAM auth,
-invokable only by CloudFront via Origin Access Control (see
-terraform/portfolio.tf) -- hitting the Function URL directly, bypassing
-CloudFront, is rejected before this code ever runs. Within the app, a
-signed session cookie (HMAC-SHA256) gates every route except /login.
+Access control is two-layered: the Function URL uses authorization_type
+NONE, but CloudFront injects a shared secret header (X-Origin-Verify) on
+every request that only it knows, and _origin_verified() rejects anything
+missing/mismatching it before any routing happens -- hitting the Function
+URL directly, bypassing CloudFront, is rejected immediately (see
+terraform/portfolio.tf for why OAC/AWS_IAM signing isn't used here: it's
+incompatible with plain HTML form POSTs). Within the app, a signed session
+cookie (HMAC-SHA256) gates every route except /login and /register.
 """
 
 import base64
@@ -36,6 +49,7 @@ import hmac
 import html
 import json
 import os
+import re
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -110,15 +124,21 @@ def _verify_session(event):
         return None
 
 
+_USERNAME_RE = re.compile(r'^[a-zA-Z0-9_-]{3,32}$')
+
+
+def _valid_username(username):
+    return bool(_USERNAME_RE.match(username or ''))
+
+
 def _hash_password(plaintext):
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac('sha256', plaintext.encode(), salt, PBKDF2_ITERATIONS).hex()
     return f"{salt.hex()}${digest}"
 
 
-def _check_password(submitted):
-    stored = _get_secret('password_hash')  # "salt_hex$hash_hex"
-    salt_hex, _, hash_hex = stored.partition('$')
+def _verify_password_hash(submitted, stored):
+    salt_hex, _, hash_hex = (stored or '').partition('$')
     if not salt_hex or not hash_hex:
         return False
     computed = hashlib.pbkdf2_hmac(
@@ -127,34 +147,72 @@ def _check_password(submitted):
     return hmac.compare_digest(computed, hash_hex)
 
 
-def _put_ssm(name, value, secure=True):
-    """Write one of this Lambda's own SSM parameters and refresh the warm-container cache.
-    Terraform only sets the *initial* value for password_hash/must_change_password
-    (lifecycle.ignore_changes -- see terraform/portfolio.tf); this Lambda owns
-    them after that."""
-    _ssm.put_parameter(
-        Name=f"{os.environ['SSM_PREFIX']}/{name}",
-        Value=value,
-        Type="SecureString" if secure else "String",
-        Overwrite=True,
+# ---- User accounts (S3 JSON, tolerant load -- style matches src/foreign_flows.py) ----
+
+def _load_users():
+    bucket = os.environ['TRADES_BUCKET']
+    key = os.environ['USERS_KEY']
+    try:
+        resp = _s3.get_object(Bucket=bucket, Key=key)
+        users = json.loads(resp['Body'].read()).get('users')
+        return users if isinstance(users, dict) else {}
+    except _s3.exceptions.NoSuchKey:
+        return {}
+    except Exception:
+        return {}
+
+
+def _save_users(users):
+    _s3.put_object(
+        Bucket=os.environ['TRADES_BUCKET'], Key=os.environ['USERS_KEY'],
+        Body=json.dumps({"users": users}, indent=2).encode(),
+        ContentType="application/json",
     )
-    _secrets_cache[name] = value
 
 
-def _must_change_password():
-    return _get_secret('must_change_password') == "true"
+def _check_password(username, submitted):
+    user = _load_users().get(username)
+    if not user:
+        # Deliberately skip the PBKDF2 computation for a nonexistent user --
+        # this leaks a small username-enumeration timing signal, an
+        # acceptable tradeoff at this app's personal/hobby scale.
+        return False
+    return _verify_password_hash(submitted, user.get('password_hash', ''))
 
 
-def _set_password(plaintext):
-    _put_ssm('password_hash', _hash_password(plaintext))
-    _put_ssm('must_change_password', "false", secure=False)
+def _must_change_password(username):
+    user = _load_users().get(username) or {}
+    return bool(user.get('must_change_password'))
+
+
+def _set_password(username, plaintext):
+    users = _load_users()
+    user = users.setdefault(username, {})
+    user['password_hash'] = _hash_password(plaintext)
+    user['must_change_password'] = False
+    _save_users(users)
+
+
+def _register_user(username, plaintext):
+    """Create a new account. Caller must have already validated the username
+    format and password rules. Returns False if the username is taken."""
+    users = _load_users()
+    if username in users:
+        return False
+    users[username] = {
+        'password_hash': _hash_password(plaintext),
+        'must_change_password': False,  # they chose this password themselves
+        'created_at': datetime.now(timezone.utc).isoformat(),
+    }
+    _save_users(users)
+    return True
 
 
 # ---- Trade storage (S3 JSON, tolerant load -- style matches src/foreign_flows.py) ----
 
-def _load_trades():
+def _load_trades(username):
     bucket = os.environ['TRADES_BUCKET']
-    key = os.environ['TRADES_KEY']
+    key = f"{os.environ['TRADES_PREFIX']}{username}.json"
     try:
         resp = _s3.get_object(Bucket=bucket, Key=key)
         trades = json.loads(resp['Body'].read()).get('trades')
@@ -165,9 +223,9 @@ def _load_trades():
         return []
 
 
-def _save_trades(trades):
+def _save_trades(username, trades):
     _s3.put_object(
-        Bucket=os.environ['TRADES_BUCKET'], Key=os.environ['TRADES_KEY'],
+        Bucket=os.environ['TRADES_BUCKET'], Key=f"{os.environ['TRADES_PREFIX']}{username}.json",
         Body=json.dumps({"trades": trades}, indent=2).encode(),
         ContentType="application/json",
     )
@@ -198,11 +256,12 @@ def _fifo_positions(trades, prices):
         by_symbol.setdefault(t['symbol'], []).append(t)
 
     positions = {}
-    totals = {'cost_basis': 0.0, 'market_value': 0.0, 'unrealized_gain': 0.0, 'realized_gain': 0.0}
+    totals = {'cost_basis': 0.0, 'market_value': 0.0, 'unrealized_gain': 0.0, 'realized_gain': 0.0, 'dividends': 0.0}
 
     for symbol, sym_trades in by_symbol.items():
         lots = deque()  # each: [qty, price]
         realized_gain = 0.0
+        dividends = 0.0
 
         for t in sorted(sym_trades, key=lambda x: x['date']):
             qty, price = float(t['quantity']), float(t['price'])
@@ -221,6 +280,10 @@ def _fifo_positions(trades, prices):
                         lots[0][0] = lot_qty - consumed
                 # A sell exceeding recorded buys (data-entry error) is not
                 # modeled as a short position -- the excess is just ignored.
+            elif t['side'] == 'dividend':
+                # Not part of FIFO lot matching -- qty*price here is shares
+                # held x per-share payout, tracked purely as income.
+                dividends += qty * price
 
         open_qty = sum(l[0] for l in lots)
         cost_basis = sum(l[0] * l[1] for l in lots)
@@ -230,7 +293,9 @@ def _fifo_positions(trades, prices):
         unrealized_gain = (market_value - cost_basis) if market_value is not None else None
         unrealized_pct = (unrealized_gain / cost_basis * 100) if (unrealized_gain is not None and cost_basis > 1e-9) else None
 
-        if has_position or abs(realized_gain) > 1e-9:
+        totals['dividends'] += dividends
+
+        if has_position or abs(realized_gain) > 1e-9 or abs(dividends) > 1e-9:
             positions[symbol] = {
                 'symbol': symbol,
                 'qty': round(open_qty, 4),
@@ -241,6 +306,7 @@ def _fifo_positions(trades, prices):
                 'unrealized_gain': round(unrealized_gain, 2) if unrealized_gain is not None else None,
                 'unrealized_pct': round(unrealized_pct, 2) if unrealized_pct is not None else None,
                 'realized_gain': round(realized_gain, 2),
+                'dividends': round(dividends, 2),
             }
             totals['cost_basis'] += cost_basis
             totals['market_value'] += market_value or 0.0
@@ -270,7 +336,7 @@ h2 { font-size:1rem; font-weight:800; margin:0 0 14px; }
 .stat { background-color:#f5f7fb; padding:12px 14px; border-radius:12px; text-align:center; flex:1; min-width:130px; border:1px solid rgba(148,163,184,0.22); }
 .stat .big { font-size:1.25rem; font-weight:800; }
 .stat .label { font-size:0.66rem; color:#667085; text-transform:uppercase; font-weight:700; margin-top:2px; }
-.bullish { color:#12b981; } .bearish { color:#ef4444; }
+.bullish { color:#12b981; } .bearish { color:#ef4444; } .dividend { color:#0ea5e9; }
 table { width:100%; border-collapse:collapse; font-size:0.85rem; }
 th, td { padding:8px 10px; text-align:left; border-bottom:1px solid rgba(148,163,184,0.28); }
 th { background-color:#f5f7fb; color:#667085; font-size:0.66rem; text-transform:uppercase; font-weight:800; }
@@ -307,8 +373,27 @@ def _render_login(error=None):
         <p><label>Password</label><input type="password" name="password" required></p>
         <p><button type="submit">Log in</button></p>
       </form>
+      <p><a href="/register">Don't have an account? Register</a></p>
     </div>"""
     return _page("Portfolio — Login", body)
+
+
+def _render_register(error=None):
+    error_html = f'<p class="error">{_esc(error)}</p>' if error else ''
+    body = f"""
+    <div class="header"><h1>📝 Create Account</h1></div>
+    <div class="card">
+      {error_html}
+      <form method="POST" action="/register">
+        <p><label>Username</label><input name="username" required autofocus
+           pattern="[a-zA-Z0-9_-]{{3,32}}" title="3-32 characters: letters, numbers, underscore, hyphen"></p>
+        <p><label>Password</label><input type="password" name="password" required minlength="8"></p>
+        <p><label>Confirm password</label><input type="password" name="confirm_password" required minlength="8"></p>
+        <p><button type="submit">Create account</button></p>
+      </form>
+      <p><a href="/login">&larr; Back to login</a></p>
+    </div>"""
+    return _page("Portfolio — Register", body)
 
 
 def _render_change_password(forced=False, error=None):
@@ -343,6 +428,7 @@ def _render_error(message):
 def _render_dashboard(positions, totals, trades):
     holdings_rows = ''
     for p in sorted(positions.values(), key=lambda x: x['symbol']):
+        avg_cost_str = f"{p['avg_cost']:.2f}" if p['avg_cost'] is not None else '—'
         price_str = f"{p['current_price']:.2f}" if p['current_price'] is not None else '—'
         mv_str = f"{p['market_value']:.2f}" if p['market_value'] is not None else '—'
         if p['unrealized_gain'] is not None:
@@ -353,16 +439,17 @@ def _render_dashboard(positions, totals, trades):
         r_cls = 'bullish' if p['realized_gain'] >= 0 else 'bearish'
         holdings_rows += (
             f'<tr><td><strong>{_esc(p["symbol"])}</strong></td><td>{p["qty"]:g}</td>'
-            f'<td>{p["avg_cost"]:.2f}</td><td>{price_str}</td><td>{mv_str}</td>'
+            f'<td>{avg_cost_str}</td><td>{price_str}</td><td>{mv_str}</td>'
             f'<td class="{u_cls}">{u_str}</td>'
-            f'<td class="{r_cls}">{p["realized_gain"]:+.2f}</td></tr>'
+            f'<td class="{r_cls}">{p["realized_gain"]:+.2f}</td>'
+            f'<td class="dividend">{p["dividends"]:.2f}</td></tr>'
         )
     if not holdings_rows:
-        holdings_rows = '<tr><td colspan="7">No trades recorded yet.</td></tr>'
+        holdings_rows = '<tr><td colspan="8">No trades recorded yet.</td></tr>'
 
     trade_rows = ''
     for t in sorted(trades, key=lambda x: x['date'], reverse=True):
-        side_cls = 'bullish' if t['side'] == 'buy' else 'bearish'
+        side_cls = {'buy': 'bullish', 'sell': 'bearish', 'dividend': 'dividend'}.get(t['side'], '')
         trade_rows += (
             f'<tr><td>{_esc(t["date"])}</td><td><strong>{_esc(t["symbol"])}</strong></td>'
             f'<td class="{side_cls}">{t["side"].upper()}</td>'
@@ -391,13 +478,14 @@ def _render_dashboard(positions, totals, trades):
         <div class="stat"><div class="big">{totals['market_value']:.2f}</div><div class="label">Market Value (KES)</div></div>
         <div class="stat"><div class="big {u_cls}">{totals['unrealized_gain']:+.2f}{unrealized_pct_str}</div><div class="label">Unrealized Gain</div></div>
         <div class="stat"><div class="big {r_cls}">{totals['realized_gain']:+.2f}</div><div class="label">Realized Gain</div></div>
+        <div class="stat"><div class="big dividend">{totals['dividends']:.2f}</div><div class="label">Dividends Received</div></div>
       </div>
     </div>
 
     <div class="card">
       <h2>Holdings</h2>
       <table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Price</th>
-      <th>Market Value</th><th>Unrealized</th><th>Realized</th></tr></thead>
+      <th>Market Value</th><th>Unrealized</th><th>Realized</th><th>Dividends</th></tr></thead>
       <tbody>{holdings_rows}</tbody></table>
     </div>
 
@@ -405,7 +493,7 @@ def _render_dashboard(positions, totals, trades):
       <h2>Add Trade</h2>
       <form class="grid" method="POST" action="/trades">
         <p><label>Symbol</label><input name="symbol" required style="text-transform:uppercase; width:100px;"></p>
-        <p><label>Side</label><select name="side"><option value="buy">Buy</option><option value="sell">Sell</option></select></p>
+        <p><label>Side</label><select name="side"><option value="buy">Buy</option><option value="sell">Sell</option><option value="dividend">Dividend</option></select></p>
         <p><label>Quantity</label><input type="number" step="any" min="0" name="quantity" required style="width:100px;"></p>
         <p><label>Price (KES)</label><input type="number" step="any" min="0" name="price" required style="width:100px;"></p>
         <p><label>Date</label><input type="date" name="date" required></p>
@@ -478,11 +566,30 @@ def _route(event):
         form = _parse_form(event)
         username = (form.get('username', [''])[0] or '').strip()
         password = form.get('password', [''])[0] or ''
-        username_ok = hmac.compare_digest(username, _get_secret('username'))
-        password_ok = _check_password(password)
-        if username_ok and password_ok:
+        if username and _check_password(username, password):
             return _redirect("/", set_cookie=_make_session_cookie(username))
         return _html_response(_render_login(error="Invalid username or password"), status=401)
+
+    if path == "/register" and method == "GET":
+        return _html_response(_render_register())
+
+    if path == "/register" and method == "POST":
+        form = _parse_form(event)
+        username = (form.get('username', [''])[0] or '').strip()
+        password = form.get('password', [''])[0] or ''
+        confirm_password = form.get('confirm_password', [''])[0] or ''
+        if not _valid_username(username):
+            return _html_response(
+                _render_register(error="Username must be 3-32 characters: letters, numbers, underscore, hyphen only."),
+                status=400,
+            )
+        if len(password) < 8:
+            return _html_response(_render_register(error="Password must be at least 8 characters."), status=400)
+        if password != confirm_password:
+            return _html_response(_render_register(error="Passwords do not match."), status=400)
+        if not _register_user(username, password):
+            return _html_response(_render_register(error="That username is already taken."), status=409)
+        return _redirect("/", set_cookie=_make_session_cookie(username))
 
     if path == "/logout":
         return _redirect("/login", set_cookie=_clear_session_cookie())
@@ -494,17 +601,17 @@ def _route(event):
 
     # A freshly bootstrapped (or just-reset) credential forces a password
     # change before anything else is reachable.
-    if _must_change_password() and path != "/change-password":
+    if _must_change_password(username) and path != "/change-password":
         return _redirect("/change-password")
 
     if path == "/change-password" and method == "GET":
-        return _html_response(_render_change_password(forced=_must_change_password()))
+        return _html_response(_render_change_password(forced=_must_change_password(username)))
 
     if path == "/change-password" and method == "POST":
         form = _parse_form(event)
         new_password = form.get('new_password', [''])[0] or ''
         confirm_password = form.get('confirm_password', [''])[0] or ''
-        forced = _must_change_password()
+        forced = _must_change_password(username)
         if len(new_password) < 8:
             return _html_response(
                 _render_change_password(forced=forced, error="Password must be at least 8 characters."),
@@ -514,11 +621,11 @@ def _route(event):
             return _html_response(
                 _render_change_password(forced=forced, error="Passwords do not match."), status=400,
             )
-        _set_password(new_password)
+        _set_password(username, new_password)
         return _redirect("/")
 
     if path == "/" and method == "GET":
-        trades = _load_trades()
+        trades = _load_trades(username)
         prices = _fetch_prices()
         positions, totals = _fifo_positions(trades, prices)
         return _html_response(_render_dashboard(positions, totals, trades))
@@ -531,24 +638,24 @@ def _route(event):
             quantity = float(form.get('quantity', [''])[0])
             price = float(form.get('price', [''])[0])
             date = (form.get('date', [''])[0] or '').strip()
-            if not symbol or side not in ('buy', 'sell') or quantity <= 0 or price <= 0 or not date:
+            if not symbol or side not in ('buy', 'sell', 'dividend') or quantity <= 0 or price <= 0 or not date:
                 raise ValueError("incomplete or invalid trade")
         except (ValueError, IndexError):
             return _html_response(
                 _render_error("Invalid trade — check symbol, side, quantity, price and date."), status=400,
             )
-        trades = _load_trades()
+        trades = _load_trades(username)
         trades.append({
             'id': str(uuid.uuid4()), 'symbol': symbol, 'side': side,
             'quantity': quantity, 'price': price, 'date': date,
         })
-        _save_trades(trades)
+        _save_trades(username, trades)
         return _redirect("/")
 
     if path.startswith("/trades/") and path.endswith("/delete") and method == "POST":
         trade_id = path.split('/')[2] if len(path.split('/')) > 2 else None
-        trades = [t for t in _load_trades() if t.get('id') != trade_id]
-        _save_trades(trades)
+        trades = [t for t in _load_trades(username) if t.get('id') != trade_id]
+        _save_trades(username, trades)
         return _redirect("/")
 
     return {"statusCode": 404, "headers": {"Content-Type": "text/plain"}, "body": "Not found"}
