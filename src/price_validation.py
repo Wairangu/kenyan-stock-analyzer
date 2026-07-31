@@ -80,11 +80,19 @@ class PriceValidator:
 
         path = self._cache_path()
 
-        # Fetch fresh
+        # Fetch fresh via the shared fast-fail HTTP helper (tight timeout +
+        # one retry; returns None instead of hanging when the source is down).
+        from utils import http_get
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = http_get(AFX_URL, headers=headers)
+        if resp is None or resp.status_code != 200:
+            logger.warning(
+                f"Reference price source unavailable — skipping validation "
+                f"and price anchoring. TradingView values will be used as-is."
+            )
+            self._reference = {}
+            return self._reference
         try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(AFX_URL, headers=headers, timeout=20)
-            resp.raise_for_status()
             self._reference = self._parse_afx(resp.text)
             logger.info(
                 f"Reference prices from {REFERENCE_SOURCE}: "
@@ -97,7 +105,7 @@ class PriceValidator:
                 except Exception as e:
                     logger.debug(f"Reference cache write error: {e}")
         except Exception as e:
-            logger.warning(f"Reference price source unavailable: {e}")
+            logger.warning(f"Reference price parse failed: {e}")
             self._reference = {}
 
         return self._reference

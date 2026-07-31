@@ -58,8 +58,12 @@ class DividendCalendar:
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
             )}
-            resp = requests.get(CALENDAR_URL, headers=headers, timeout=25)
-            resp.raise_for_status()
+            from utils import http_get
+            resp = http_get(CALENDAR_URL, headers=headers)
+            if resp is None or resp.status_code != 200:
+                logger.warning("Dividend calendar unavailable — dividends will use TradingView only")
+                self._data = {}
+                return self._data
             self._data = self._parse(resp.text)
             logger.info(
                 f"Dividend calendar ({SOURCE}): {len(self._data)} stocks with "

@@ -25,6 +25,7 @@ from html import unescape
 import requests
 
 from logger import get_logger
+from utils import http_get
 
 logger = get_logger(__name__)
 
@@ -56,8 +57,9 @@ def fetch_news(max_items_per_topic: int = 8) -> list[dict]:
     for topic, query in NEWS_QUERIES:
         try:
             url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-KE&gl=KE&ceid=KE:en"
-            r = requests.get(url, headers=_UA, timeout=20)
-            r.raise_for_status()
+            r = http_get(url, headers=_UA)
+            if r is None or r.status_code != 200:
+                continue
             items = re.findall(r"<item>(.*?)</item>", r.text, re.S)
             for raw in items[:max_items_per_topic]:
                 title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", raw, re.S)
@@ -103,8 +105,10 @@ def fetch_cbk() -> dict:
     url = "https://www.centralbank.go.ke/"
     out = {"cbr_pct": None, "cbr_note": None, "inflation_note": None, "source_url": url}
     try:
-        r = requests.get(url, headers=_UA, timeout=20)
-        r.raise_for_status()
+        r = http_get(url, headers=_UA)
+        if r is None or r.status_code != 200:
+            logger.warning("Market Pulse — CBK unavailable, section will be empty")
+            return out
         t = r.text
         # CBR: e.g. "MPC retains the CBR at 8.75 percent"
         m = re.search(
@@ -145,7 +149,7 @@ def fetch_oil() -> list[dict]:
     for sym, name in [("BZ=F", "Brent"), ("CL=F", "WTI")]:
         try:
             d = yf.download(sym, period="7d", interval="1d", progress=False,
-                            timeout=20, auto_adjust=False)
+                            timeout=8, auto_adjust=False)
             if d.empty:
                 continue
             if isinstance(d.columns, pd.MultiIndex):
@@ -257,7 +261,11 @@ def fetch_fx_pulse() -> list[dict]:
     Return [{code, name, rate_kes, updated}] for the majors vs KES.
     """
     try:
-        r = requests.get("https://open.er-api.com/v6/latest/USD", headers=_UA, timeout=15).json()
+        resp = http_get("https://open.er-api.com/v6/latest/USD", headers=_UA)
+        if resp is None or resp.status_code != 200:
+            logger.warning("Market Pulse — FX unavailable")
+            return []
+        r = resp.json()
         kes_per_usd = r.get("rates", {}).get("KES")
         eur_per_usd = r.get("rates", {}).get("EUR")
         gbp_per_usd = r.get("rates", {}).get("GBP")

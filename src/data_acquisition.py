@@ -374,7 +374,7 @@ class DataAcquisition:
                 'Chrome/120.0.0.0 Safari/537.36'
             ),
         }
-        resp = requests.get(NSE_MARKET_STATS_URL, headers=headers, timeout=15)
+        resp = requests.get(NSE_MARKET_STATS_URL, headers=headers, timeout=(3, 6))
         resp.raise_for_status()
 
         # Find the equity-specific PDF download link
@@ -431,7 +431,8 @@ class DataAcquisition:
                 'AppleWebKit/537.36'
             ),
         }
-        resp = requests.get(pdf_url, headers=headers, timeout=30)
+        # PDF is a larger download so allow a longer read timeout.
+        resp = requests.get(pdf_url, headers=headers, timeout=(3, 15))
         resp.raise_for_status()
 
         logger.info(f"Downloaded NSE PDF: {len(resp.content)} bytes")
@@ -608,15 +609,14 @@ class DataAcquisition:
                 yahoo_symbol,
                 period=period,
                 interval=interval,
-                progress=False,
-                timeout=30,
+                progress=False, timeout=10,
             )
             if data.empty:
                 # Try without .NR suffix
                 logger.debug(f"  {yahoo_symbol} empty, trying {symbol}")
                 data = yf.download(
                     symbol, period=period, interval=interval,
-                    progress=False, timeout=30,
+                    progress=False, timeout=10,
                 )
 
             if data.empty:

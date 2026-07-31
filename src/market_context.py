@@ -27,7 +27,11 @@ def fetch_usd_kes():
     Fetch the current USD/KES rate. Returns dict {rate, updated} or None.
     """
     try:
-        r = requests.get(FX_URL, timeout=15).json()
+        from utils import http_get
+        resp = http_get(FX_URL)
+        if resp is None or resp.status_code != 200:
+            return None
+        r = resp.json()
         rate = r.get("rates", {}).get("KES")
         if rate:
             return {

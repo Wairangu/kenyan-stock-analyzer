@@ -11,6 +11,46 @@ from typing import Tuple, List
 
 logger = logging.getLogger(__name__)
 
+# ---- Shared HTTP policy ----
+# Tuned so a dead source fails within ~10 seconds worst-case (one retry),
+# instead of the earlier 20-25s hangs users saw when afx or CBK were down.
+#   connect_timeout: how long to wait to establish the TCP/TLS connection.
+#     3s is generous for healthy networks; a source not answering by then is
+#     unreachable.
+#   read_timeout:    how long to wait for the response body after connecting.
+#     6s covers slow-but-alive servers.
+DEFAULT_HTTP_TIMEOUT: Tuple[int, int] = (3, 6)
+
+
+def http_get(url, *, headers=None, timeout=DEFAULT_HTTP_TIMEOUT, retries=1,
+             backoff=0.5, allow_redirects=True):
+    """
+    GET a URL with a tight timeout policy and one quick retry.
+
+    - Fails fast (no long hangs when a source is down).
+    - On timeout/connection error, waits `backoff` seconds and retries once
+      (this covers most transient DNS/network hiccups).
+    - Never raises to the caller — returns the requests.Response on success
+      or None on any failure. Callers already treat failure as "skip this
+      source"; this keeps that behaviour but does it quickly.
+    """
+    import requests
+    from requests.exceptions import RequestException
+
+    attempts = max(1, retries + 1)
+    last_err = None
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers=headers or {}, timeout=timeout,
+                             allow_redirects=allow_redirects)
+            return r
+        except RequestException as e:
+            last_err = e
+            if i < attempts - 1:
+                time.sleep(backoff)
+    logger.warning(f"http_get failed for {url}: {last_err}")
+    return None
+
 CACHE_MARKER = ".cache_date"
 
 
