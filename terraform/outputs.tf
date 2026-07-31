@@ -23,6 +23,15 @@ output "lambda_function_arn" {
   value = aws_lambda_function.analyzer.arn
 }
 
+output "portfolio_url" {
+  description = "CloudFront-fronted custom domain serving the password-protected portfolio tracker over HTTPS."
+  value       = "https://${aws_route53_record.portfolio.name}"
+}
+
+output "portfolio_lambda_function_name" {
+  value = aws_lambda_function.portfolio.function_name
+}
+
 output "ses_verification_note" {
   description = "Whether Terraform created a new SES identity that still needs the verification email clicked, or the address(es) were already verified (no action needed)."
   value = (

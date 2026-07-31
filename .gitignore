@@ -55,3 +55,4 @@ terraform/*.tfstate.*
 terraform/*.tfplan
 terraform/terraform.tfvars
 terraform/crash.log
+terraform/.build/

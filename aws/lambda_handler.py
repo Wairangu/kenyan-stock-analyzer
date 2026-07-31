@@ -12,6 +12,7 @@ the Dockerfile and build script.
 
 import os
 import sys
+import json
 import mimetypes
 from datetime import datetime
 
@@ -92,6 +93,28 @@ def _upload_reports(report_directory, bucket, logger):
         uploaded.append(name)
         logger.info(f"  Uploaded s3://{bucket}/{name} ({content_type})")
     return uploaded
+
+
+def _upload_prices(fundamentals_data, bucket, logger):
+    """
+    Publish a small {symbol: {price, change_pct}} snapshot alongside the
+    HTML dashboard, covering every NSE stock fetch_all_fundamentals()
+    returned (not just the watchlist). Public data already shown on the
+    dashboard itself, so no new sensitivity -- lets other lightweight
+    services (e.g. the portfolio tracker) read current prices without
+    needing their own TradingView/tvkit dependency.
+    """
+    prices = {
+        sym: {"price": d.get("close"), "change_pct": d.get("change_pct")}
+        for sym, d in (fundamentals_data or {}).items()
+        if d.get("close") is not None
+    }
+    boto3.client('s3').put_object(
+        Bucket=bucket, Key="prices.json",
+        Body=json.dumps(prices).encode(), ContentType="application/json",
+    )
+    logger.info(f"  Uploaded s3://{bucket}/prices.json ({len(prices)} symbols)")
+    return len(prices)
 
 
 def _send_email(subject, html_body, logger):
@@ -266,6 +289,7 @@ def handler(event, context):
         bucket = os.environ['S3_BUCKET']
         logger.info(f"Uploading dashboard to s3://{bucket} ...")
         result["uploaded"] = _upload_reports(config.report_directory, bucket, logger)
+        result["prices_symbols"] = _upload_prices(fundamentals_data, bucket, logger)
 
         distribution_id = os.environ.get('CLOUDFRONT_DISTRIBUTION_ID')
         if distribution_id:

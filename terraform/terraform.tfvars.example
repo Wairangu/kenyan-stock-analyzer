@@ -15,3 +15,12 @@ ses_recipient = "you@example.com"
 # identity is just "yourdomain.com") -- leave blank/unset for a plain
 # email-address-verified identity.
 # ses_sender_identity = "yourdomain.com"
+
+# Portfolio tracker (portfolio.getkitters.com) login credentials.
+# No safe placeholder for these -- required, no default.
+portfolio_username = "your_chosen_username"
+
+# Generate the password hash locally (never put the plaintext password in
+# this file or anywhere in the repo):
+#   python3 -c "import os,hashlib; s=os.urandom(16); print(s.hex()+'$'+hashlib.pbkdf2_hmac('sha256', b'YOUR_PASSWORD', s, 200000).hex())"
+portfolio_password_hash = "salt_hex$hash_hex"
