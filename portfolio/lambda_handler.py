@@ -61,6 +61,10 @@ import boto3
 SESSION_MAX_AGE_SECONDS = 12 * 3600  # 12 hours
 COOKIE_NAME = "session"
 PBKDF2_ITERATIONS = 200_000
+# Approximate broker commission + statutory NSE/CDSC/CMA levies, applied to
+# every buy/sell (not dividends) so cost basis and realized gain reflect
+# what actually lands in the account, not just the raw quoted price.
+TRANSACTION_FEE_PCT = float(os.environ.get('TRANSACTION_FEE_PCT', '0.015'))
 
 _esc = html.escape
 _ssm = boto3.client('ssm')
@@ -266,13 +270,14 @@ def _fifo_positions(trades, prices):
         for t in sorted(sym_trades, key=lambda x: x['date']):
             qty, price = float(t['quantity']), float(t['price'])
             if t['side'] == 'buy':
-                lots.append([qty, price])
+                lots.append([qty, price * (1 + TRANSACTION_FEE_PCT)])
             elif t['side'] == 'sell':
+                net_price = price * (1 - TRANSACTION_FEE_PCT)
                 remaining = qty
                 while remaining > 1e-9 and lots:
                     lot_qty, lot_price = lots[0]
                     consumed = min(lot_qty, remaining)
-                    realized_gain += consumed * (price - lot_price)
+                    realized_gain += consumed * (net_price - lot_price)
                     remaining -= consumed
                     if lot_qty - consumed <= 1e-9:
                         lots.popleft()
@@ -484,6 +489,10 @@ def _render_dashboard(positions, totals, trades):
 
     <div class="card">
       <h2>Holdings</h2>
+      <p style="font-size:0.72rem; color:#667085; margin:-8px 0 12px;">
+        Avg Cost, Unrealized and Realized include an assumed {TRANSACTION_FEE_PCT * 100:.1f}%
+        brokerage/statutory fee on buys and sells, to match real broker P&amp;L.
+      </p>
       <table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Price</th>
       <th>Market Value</th><th>Unrealized</th><th>Realized</th><th>Dividends</th></tr></thead>
       <tbody>{holdings_rows}</tbody></table>

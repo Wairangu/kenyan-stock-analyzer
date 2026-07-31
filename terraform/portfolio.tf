@@ -136,6 +136,10 @@ resource "aws_lambda_function" "portfolio" {
       PRICES_URL           = "https://stocks.getkitters.com/prices.json"
       SSM_PREFIX           = "/kenyan-stock-portfolio"
       ORIGIN_VERIFY_SECRET = random_password.portfolio_origin_secret.result
+      # Approximate NSE broker commission + statutory levies (CDSC/NSE/CMA),
+      # applied to buy/sell FIFO math so P&L matches what a real brokerage
+      # account shows -- see portfolio/lambda_handler.py's _fifo_positions.
+      TRANSACTION_FEE_PCT = "0.015"
     }
   }
 
