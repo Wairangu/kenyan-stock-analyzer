@@ -439,21 +439,21 @@ def _render_error(message):
 def _render_dashboard(positions, totals, trades):
     holdings_rows = ''
     for p in sorted(positions.values(), key=lambda x: x['symbol']):
-        avg_cost_str = f"{p['avg_cost']:.2f}" if p['avg_cost'] is not None else '—'
-        price_str = f"{p['current_price']:.2f}" if p['current_price'] is not None else '—'
-        mv_str = f"{p['market_value']:.2f}" if p['market_value'] is not None else '—'
+        avg_cost_str = f"{p['avg_cost']:,.2f}" if p['avg_cost'] is not None else '—'
+        price_str = f"{p['current_price']:,.2f}" if p['current_price'] is not None else '—'
+        mv_str = f"{p['market_value']:,.2f}" if p['market_value'] is not None else '—'
         if p['unrealized_gain'] is not None:
             u_cls = 'bullish' if p['unrealized_gain'] >= 0 else 'bearish'
-            u_str = f"{p['unrealized_gain']:+.2f} ({p['unrealized_pct']:+.1f}%)"
+            u_str = f"{p['unrealized_gain']:+,.2f} ({p['unrealized_pct']:+.1f}%)"
         else:
             u_cls, u_str = '', '—'
         r_cls = 'bullish' if p['realized_gain'] >= 0 else 'bearish'
         holdings_rows += (
-            f'<tr><td><strong>{_esc(p["symbol"])}</strong></td><td>{p["qty"]:g}</td>'
+            f'<tr><td><strong>{_esc(p["symbol"])}</strong></td><td>{p["qty"]:,g}</td>'
             f'<td>{avg_cost_str}</td><td>{price_str}</td><td>{mv_str}</td>'
             f'<td class="{u_cls}">{u_str}</td>'
-            f'<td class="{r_cls}">{p["realized_gain"]:+.2f}</td>'
-            f'<td class="dividend">{p["dividends"]:.2f}</td></tr>'
+            f'<td class="{r_cls}">{p["realized_gain"]:+,.2f}</td>'
+            f'<td class="dividend">{p["dividends"]:,.2f}</td></tr>'
         )
     if not holdings_rows:
         holdings_rows = '<tr><td colspan="8">No trades recorded yet.</td></tr>'
@@ -464,7 +464,7 @@ def _render_dashboard(positions, totals, trades):
         trade_rows += (
             f'<tr><td>{_esc(t["date"])}</td><td><strong>{_esc(t["symbol"])}</strong></td>'
             f'<td class="{side_cls}">{t["side"].upper()}</td>'
-            f'<td>{float(t["quantity"]):g}</td><td>{float(t["price"]):.2f}</td>'
+            f'<td>{float(t["quantity"]):,g}</td><td>{float(t["price"]):,.2f}</td>'
             f'<td><form class="inline" method="POST" action="/trades/{_esc(t["id"])}/delete" '
             f'onsubmit="return confirm(\'Delete this trade?\')">'
             f'<button type="submit" class="danger">Delete</button></form></td></tr>'
@@ -485,12 +485,12 @@ def _render_dashboard(positions, totals, trades):
 
     <div class="card">
       <div class="stats">
-        <div class="stat"><div class="big">{totals['cost_basis']:.2f}</div><div class="label">Cost Basis (KES)</div></div>
-        <div class="stat"><div class="big">{totals['market_value']:.2f}</div><div class="label">Market Value (KES)</div></div>
-        <div class="stat"><div class="big {u_cls}">{totals['unrealized_gain']:+.2f}{unrealized_pct_str}</div><div class="label">Unrealized Gain</div></div>
-        <div class="stat"><div class="big {r_cls}">{totals['realized_gain']:+.2f}</div><div class="label">Realized Gain</div></div>
-        <div class="stat"><div class="big dividend">{totals['dividends']:.2f}</div><div class="label">Dividends Received</div></div>
-        <div class="stat"><div class="big fee">-{totals['fees']:.2f}</div><div class="label">Fees Paid ({TRANSACTION_FEE_PCT * 100:.1f}%)</div></div>
+        <div class="stat"><div class="big">{totals['cost_basis']:,.2f}</div><div class="label">Cost Basis (KES)</div></div>
+        <div class="stat"><div class="big">{totals['market_value']:,.2f}</div><div class="label">Market Value (KES)</div></div>
+        <div class="stat"><div class="big {u_cls}">{totals['unrealized_gain']:+,.2f}{unrealized_pct_str}</div><div class="label">Unrealized Gain</div></div>
+        <div class="stat"><div class="big {r_cls}">{totals['realized_gain']:+,.2f}</div><div class="label">Realized Gain</div></div>
+        <div class="stat"><div class="big dividend">{totals['dividends']:,.2f}</div><div class="label">Dividends Received</div></div>
+        <div class="stat"><div class="big fee">-{totals['fees']:,.2f}</div><div class="label">Fees Paid ({TRANSACTION_FEE_PCT * 100:.1f}%)</div></div>
       </div>
     </div>
 
