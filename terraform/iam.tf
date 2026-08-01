@@ -47,6 +47,15 @@ resource "aws_iam_role_policy" "lambda_exec" {
         Effect   = "Allow"
         Action   = ["cloudfront:CreateInvalidation"]
         Resource = aws_cloudfront_distribution.dashboard.arn
+      },
+      {
+        # Table extraction for the government bond prices section (see
+        # src/bond_data.py) -- AnalyzeDocument has no resource-level ARN
+        # to scope to, "*" is the only valid Resource for this action.
+        Sid      = "AnalyzeBondPricesPdf"
+        Effect   = "Allow"
+        Action   = ["textract:AnalyzeDocument"]
+        Resource = "*"
       }
     ]
   })

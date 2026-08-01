@@ -229,6 +229,13 @@ def handler(event, context):
     except Exception as e:
         logger.warning(f"Earnings ICS export skipped: {e}")
 
+    bonds = []
+    try:
+        from bond_data import fetch_active_government_bonds
+        bonds = fetch_active_government_bonds()
+    except Exception as e:
+        logger.warning(f"Bond data skipped: {e}")
+
     sector_medians = {}
     usd_kes = None
     try:
@@ -271,7 +278,7 @@ def handler(event, context):
     dashboard_url = os.environ.get('DASHBOARD_URL')  # set by Terraform to the S3 website endpoint
     email_body = notifier.generate_email_body(
         analysis_results, sector_data, breadth, dashboard_url=dashboard_url,
-        fundamentals_data=fundamentals_data, scores=scores,
+        fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
     )
     subject = f"NSE Daily Report — {datetime.now():%Y-%m-%d}"
 

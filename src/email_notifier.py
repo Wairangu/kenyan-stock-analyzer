@@ -124,7 +124,7 @@ class EmailNotifier:
 
     def generate_email_body(self, analysis_results, sector_data=None,
                             breadth=None, dashboard_url=None,
-                            fundamentals_data=None, scores=None):
+                            fundamentals_data=None, scores=None, bonds=None):
         """
         Generate a compact HTML email body with market summary.
 
@@ -148,6 +148,11 @@ class EmailNotifier:
             scores: dict from scoring.score_stock() per symbol, used for
                 the Score column. Stocks render "—" for that column when
                 omitted.
+            bonds: list of dicts from bond_data.fetch_active_government_bonds(),
+                the government bonds that actually traded on the NSE the
+                previous session. Section is omitted entirely when empty
+                (most days won't have this if bond_data's PDF extraction
+                fails -- it fails safe, not required for the email to send).
 
         Returns:
             HTML string suitable for email clients.
@@ -365,6 +370,29 @@ class EmailNotifier:
                     f'<td>{data["count"]}</td>'
                     f'<td class="{cls}">{data["avg_change_pct"]:+.2f}%</td>'
                     f'<td>{data["bullish_ratio"]}%</td></tr>\n'
+                )
+            html += "    </table>\n    </div>\n"
+
+        # Government bonds actively traded on the NSE (Treasury + Infrastructure)
+        if bonds:
+            html += """
+    <div class="card"><div class="bar"></div>
+    <h2>&#127974; Government Bonds &mdash; Actively Traded</h2>
+    <p style="font-size:0.78rem; color:#667085; margin:0 0 12px;">
+        Machine-extracted from the NSE's daily bond prices PDF &mdash; treat as
+        approximate and verify before acting on any figure.
+    </p>
+    <table>
+        <tr><th>Bond</th><th>Coupon</th><th>Yield</th><th>Clean Price</th><th>Value Traded (KES)</th></tr>
+"""
+            for b in bonds:
+                coupon = f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—'
+                yld = f"{b['yield_pct']:.2f}%" if b.get('yield_pct') is not None else '—'
+                clean = f"{b['clean_price']:.2f}" if b.get('clean_price') is not None else '—'
+                traded = f"{b['value_traded']:,.0f}" if b.get('value_traded') is not None else '—'
+                html += (
+                    f'        <tr><td><strong>{b["issue_no"]}</strong></td>'
+                    f'<td>{coupon}</td><td>{yld}</td><td>{clean}</td><td>{traded}</td></tr>\n'
                 )
             html += "    </table>\n    </div>\n"
 

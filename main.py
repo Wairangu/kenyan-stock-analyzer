@@ -183,6 +183,15 @@ def main():
         except Exception as e:
             logger.warning(f"Earnings ICS export skipped: {e}")
 
+        # ---- Actively-traded government bonds (NSE bond prices PDF) ----
+        bonds = []
+        try:
+            from bond_data import fetch_active_government_bonds
+            logger.info("Fetching actively-traded government bonds...")
+            bonds = fetch_active_government_bonds()
+        except Exception as e:
+            logger.warning(f"Bond data skipped: {e}")
+
         # ---- Market context: sector medians + USD/KES ----
         sector_medians = {}
         usd_kes = None
@@ -285,7 +294,7 @@ def main():
                 notifier = EmailNotifier(config)
                 body = notifier.generate_email_body(
                     analysis_results, sector_data, breadth,
-                    fundamentals_data=fundamentals_data, scores=scores,
+                    fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
                 )
                 notifier.send_report(
                     f"NSE Daily Report — {analysis_date.strftime('%Y-%m-%d')}",

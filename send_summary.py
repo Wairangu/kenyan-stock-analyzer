@@ -146,6 +146,14 @@ def main():
     except Exception as e:
         logger.warning(f"Earnings ICS export skipped: {e}")
 
+    # ---- Actively-traded government bonds (NSE bond prices PDF) ----
+    bonds = []
+    try:
+        from bond_data import fetch_active_government_bonds
+        bonds = fetch_active_government_bonds()
+    except Exception as e:
+        logger.warning(f"Bond data skipped: {e}")
+
     # ---- Context, scoring, alerts ----
     usd_kes = None
     try:
@@ -194,7 +202,7 @@ def main():
     notifier = EmailNotifier(config)
     body = notifier.generate_email_body(
         analysis_results, sector_data, breadth,
-        fundamentals_data=fundamentals_data, scores=scores,
+        fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
     )
     attachments = [pdf_path] if pdf_path else []
     if ics_path and os.path.exists(ics_path):
