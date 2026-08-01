@@ -260,18 +260,22 @@ def _fifo_positions(trades, prices):
         by_symbol.setdefault(t['symbol'], []).append(t)
 
     positions = {}
-    totals = {'cost_basis': 0.0, 'market_value': 0.0, 'unrealized_gain': 0.0, 'realized_gain': 0.0, 'dividends': 0.0}
+    totals = {'cost_basis': 0.0, 'market_value': 0.0, 'unrealized_gain': 0.0, 'realized_gain': 0.0,
+              'dividends': 0.0, 'fees': 0.0}
 
     for symbol, sym_trades in by_symbol.items():
         lots = deque()  # each: [qty, price]
         realized_gain = 0.0
         dividends = 0.0
+        fees = 0.0
 
         for t in sorted(sym_trades, key=lambda x: x['date']):
             qty, price = float(t['quantity']), float(t['price'])
             if t['side'] == 'buy':
+                fees += qty * price * TRANSACTION_FEE_PCT
                 lots.append([qty, price * (1 + TRANSACTION_FEE_PCT)])
             elif t['side'] == 'sell':
+                fees += qty * price * TRANSACTION_FEE_PCT
                 net_price = price * (1 - TRANSACTION_FEE_PCT)
                 remaining = qty
                 while remaining > 1e-9 and lots:
@@ -299,6 +303,7 @@ def _fifo_positions(trades, prices):
         unrealized_pct = (unrealized_gain / cost_basis * 100) if (unrealized_gain is not None and cost_basis > 1e-9) else None
 
         totals['dividends'] += dividends
+        totals['fees'] += fees
 
         if has_position or abs(realized_gain) > 1e-9 or abs(dividends) > 1e-9:
             positions[symbol] = {
@@ -312,6 +317,7 @@ def _fifo_positions(trades, prices):
                 'unrealized_pct': round(unrealized_pct, 2) if unrealized_pct is not None else None,
                 'realized_gain': round(realized_gain, 2),
                 'dividends': round(dividends, 2),
+                'fees': round(fees, 2),
             }
             totals['cost_basis'] += cost_basis
             totals['market_value'] += market_value or 0.0
@@ -341,7 +347,7 @@ h2 { font-size:1rem; font-weight:800; margin:0 0 14px; }
 .stat { background-color:#f5f7fb; padding:12px 14px; border-radius:12px; text-align:center; flex:1; min-width:130px; border:1px solid rgba(148,163,184,0.22); }
 .stat .big { font-size:1.25rem; font-weight:800; }
 .stat .label { font-size:0.66rem; color:#667085; text-transform:uppercase; font-weight:700; margin-top:2px; }
-.bullish { color:#12b981; } .bearish { color:#ef4444; } .dividend { color:#0ea5e9; }
+.bullish { color:#12b981; } .bearish { color:#ef4444; } .dividend { color:#0ea5e9; } .fee { color:#f59e0b; }
 table { width:100%; border-collapse:collapse; font-size:0.85rem; }
 th, td { padding:8px 10px; text-align:left; border-bottom:1px solid rgba(148,163,184,0.28); }
 th { background-color:#f5f7fb; color:#667085; font-size:0.66rem; text-transform:uppercase; font-weight:800; }
@@ -484,14 +490,16 @@ def _render_dashboard(positions, totals, trades):
         <div class="stat"><div class="big {u_cls}">{totals['unrealized_gain']:+.2f}{unrealized_pct_str}</div><div class="label">Unrealized Gain</div></div>
         <div class="stat"><div class="big {r_cls}">{totals['realized_gain']:+.2f}</div><div class="label">Realized Gain</div></div>
         <div class="stat"><div class="big dividend">{totals['dividends']:.2f}</div><div class="label">Dividends Received</div></div>
+        <div class="stat"><div class="big fee">-{totals['fees']:.2f}</div><div class="label">Fees Paid ({TRANSACTION_FEE_PCT * 100:.1f}%)</div></div>
       </div>
     </div>
 
     <div class="card">
       <h2>Holdings</h2>
       <p style="font-size:0.72rem; color:#667085; margin:-8px 0 12px;">
-        Avg Cost, Unrealized and Realized include an assumed {TRANSACTION_FEE_PCT * 100:.1f}%
-        brokerage/statutory fee on buys and sells, to match real broker P&amp;L.
+        Avg Cost, Unrealized and Realized already have the {TRANSACTION_FEE_PCT * 100:.1f}%
+        brokerage/statutory fee on buys and sells factored in (see Fees Paid above),
+        to match real broker P&amp;L.
       </p>
       <table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Price</th>
       <th>Market Value</th><th>Unrealized</th><th>Realized</th><th>Dividends</th></tr></thead>
