@@ -40,6 +40,13 @@ needed. It deliberately does NOT pick one single "best" bond overall,
 since the right maturity depends on the reader's own time horizon, which
 this tool has no way to know.
 
+`bond_market_verdict()` answers a different question -- not which bond,
+but whether bonds are worth buying at all right now -- by comparing the
+day's median actively-traded yield to the Central Bank Rate (the standard
+risk-free benchmark). A wide spread over the CBR is a genuine premium for
+locking money up; a thin or negative spread means a T-bill or fixed
+deposit may pay similarly without the duration risk.
+
 Extraction reliability: even with Textract, individual digits in the
 ISIN/numeric columns are still sometimes misread. Two defenses:
   1. ISIN check-digit validation (ISO 6166) -- a row whose ISIN fails its
@@ -56,6 +63,7 @@ required source.
 """
 
 import re
+import statistics
 from datetime import datetime
 
 import requests
@@ -354,6 +362,68 @@ def recommend_bonds(bonds):
     return picks
 
 
+def bond_market_verdict(bonds):
+    """
+    A single top-line "is now a decent time to buy government bonds at
+    all" verdict, based on the spread between actively-traded yields and
+    the Central Bank Rate (CBR) -- the standard risk-free benchmark
+    T-bills/T-bonds get priced against, already scraped by
+    market_pulse.fetch_cbk(). A wide spread means bonds are paying a real
+    premium for locking your money up for years; a thin or negative
+    spread means you're barely (or not) being paid more than you'd get
+    from a T-bill or fixed deposit without the duration risk.
+
+    Returns {verdict, label, cbr_pct, median_yield_pct, spread_pts, reason}
+    or None if there's no CBR figure or no bond yields to compare against
+    (fails safe, same as the rest of this module -- CBR is scraped off the
+    CBK homepage's front-page text, which can change layout at any time).
+    """
+    yields = [b['yield_pct'] for b in bonds if b.get('yield_pct') is not None]
+    if not yields:
+        return None
+    try:
+        from market_pulse import fetch_cbk
+        cbr = fetch_cbk().get('cbr_pct')
+    except Exception as e:
+        logger.warning(f"Bond verdict: CBR unavailable ({e})")
+        return None
+    if cbr is None:
+        return None
+
+    median_yield = statistics.median(yields)
+    spread = median_yield - cbr
+
+    if spread >= 2:
+        verdict, label = 'buy', 'Attractive'
+        reason = (
+            f"Median actively-traded yield ({median_yield:.2f}%) is {spread:.2f} pts "
+            f"above the CBR ({cbr:.2f}%) -- a wide premium over the policy rate."
+        )
+    elif spread >= 0:
+        verdict, label = 'hold', 'Fair'
+        reason = (
+            f"Median actively-traded yield ({median_yield:.2f}%) is only {spread:.2f} pts "
+            f"above the CBR ({cbr:.2f}%) -- a modest premium, worth weighing against a "
+            f"T-bill or fixed deposit before committing to the longer lock-up."
+        )
+    else:
+        verdict, label = 'avoid', 'Unattractive'
+        reason = (
+            f"Median actively-traded yield ({median_yield:.2f}%) is actually below the "
+            f"CBR ({cbr:.2f}%) -- years of duration risk for less than the risk-free "
+            f"policy rate."
+        )
+
+    return {
+        'verdict': verdict,
+        'label': label,
+        'cbr_pct': cbr,
+        'median_yield_pct': round(median_yield, 2),
+        'spread_pts': round(spread, 2),
+        'reason': reason,
+    }
+
+
 # ---- Test ----
 if __name__ == "__main__":
     from logger import setup_logging
@@ -364,3 +434,4 @@ if __name__ == "__main__":
     print("\nRecommended:")
     for p in recommend_bonds(bonds):
         print(p)
+    print("\nVerdict:", bond_market_verdict(bonds))

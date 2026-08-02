@@ -385,7 +385,15 @@ class EmailNotifier:
         soon a bond matures matters more than how much traded today.
     </p>
 """
-            from bond_data import recommend_bonds
+            from bond_data import bond_market_verdict, recommend_bonds
+            verdict = bond_market_verdict(bonds)
+            if verdict:
+                badge_class = {'buy': 'buy', 'hold': 'neutral', 'avoid': 'sell'}[verdict['verdict']]
+                html += (
+                    '    <p style="font-size:0.85rem; margin:0 0 14px;">'
+                    f'<span class="badge {badge_class}">{verdict["label"]}</span> '
+                    f'<span style="color:#344054;">{verdict["reason"]}</span></p>\n'
+                )
             picks = recommend_bonds(bonds)
             if picks:
                 html += """
