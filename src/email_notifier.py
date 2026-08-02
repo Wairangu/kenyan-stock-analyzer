@@ -380,19 +380,23 @@ class EmailNotifier:
     <h2>&#127974; Government Bonds &mdash; Actively Traded</h2>
     <p style="font-size:0.78rem; color:#667085; margin:0 0 12px;">
         Machine-extracted from the NSE's daily bond prices PDF &mdash; treat as
-        approximate and verify before acting on any figure.
+        approximate and verify before acting on any figure. Sorted by maturity
+        (soonest first), then by yield &mdash; for a buy-and-hold investor, how
+        soon a bond matures matters more than how much traded today.
     </p>
     <table>
-        <tr><th>Bond</th><th>Coupon</th><th>Yield</th><th>Clean Price</th><th>Value Traded (KES)</th></tr>
+        <tr><th>Bond</th><th>Maturity</th><th>Yield</th><th>Coupon</th><th>Clean Price</th><th>Value Traded (KES)</th></tr>
 """
             for b in bonds:
+                maturity = str(b['maturity_year']) if b.get('maturity_year') is not None else '—'
                 coupon = f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—'
                 yld = f"{b['yield_pct']:.2f}%" if b.get('yield_pct') is not None else '—'
                 clean = f"{b['clean_price']:.2f}" if b.get('clean_price') is not None else '—'
                 traded = f"{b['value_traded']:,.0f}" if b.get('value_traded') is not None else '—'
                 html += (
                     f'        <tr><td><strong>{b["issue_no"]}</strong></td>'
-                    f'<td>{coupon}</td><td>{yld}</td><td>{clean}</td><td>{traded}</td></tr>\n'
+                    f'<td>{maturity}</td><td>{yld}</td><td>{coupon}</td>'
+                    f'<td>{clean}</td><td>{traded}</td></tr>\n'
                 )
             html += "    </table>\n    </div>\n"
 

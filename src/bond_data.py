@@ -24,6 +24,13 @@ section are excluded. A bond counts as "traded" when it has a real value
 traded for the day, not just an outstanding listing -- most of the ~150
 listed bonds don't trade on any given day.
 
+Sorted by maturity (soonest first), then by yield (highest first) within
+the same maturity year. For a buy-and-hold retail reader, how soon a bond
+matures (duration/interest-rate risk) matters more than how much traded
+that day, so the list is built for "which one fits my time horizon and
+pays the most" rather than "which one was busiest today". Value traded is
+still shown, just no longer the sort key.
+
 Extraction reliability: even with Textract, individual digits in the
 ISIN/numeric columns are still sometimes misread. Two defenses:
   1. ISIN check-digit validation (ISO 6166) -- a row whose ISIN fails its
@@ -206,9 +213,19 @@ def _row_to_bond(row):
     if not value_traded:
         return None  # didn't trade this session -- out of scope for the email
 
+    # Approximate maturity year from the issue number (e.g. "FXD/2018/15Yr"
+    # -> issued 2018, 15-year tenor -> matures ~2033). The PDF doesn't expose
+    # an exact redemption date column we extract, so this is a proxy -- good
+    # enough to order bonds by how soon they mature, not their exact date.
+    issue_year = int(issue_m.group(2))
+    tenor_years = float(issue_m.group(3))
+    maturity_year = issue_year + round(tenor_years)
+
     return {
         'issue_no': issue_no,
         'isin': m.group(),
+        'tenor_years': tenor_years,
+        'maturity_year': maturity_year,
         'coupon_pct': _num(row.get(_COL_COUPON), _PLAUSIBLE['coupon']),
         'yield_pct': _num(row.get(_COL_YIELD), _PLAUSIBLE['yield']),
         'clean_price': _num(row.get(_COL_CLEAN), _PLAUSIBLE['clean']),
@@ -253,14 +270,28 @@ def _parse_rows(rows):
         existing = by_isin.get(b['isin'])
         if not existing or (b['value_traded'] or 0) > (existing['value_traded'] or 0):
             by_isin[b['isin']] = b
-    return sorted(by_isin.values(), key=lambda b: b['value_traded'] or 0, reverse=True)
+
+    # Soonest-maturing first (duration risk), then highest yield first among
+    # bonds maturing in the same year. Missing values sort last within their
+    # tier rather than crashing the comparison.
+    return sorted(
+        by_isin.values(),
+        key=lambda b: (
+            b['maturity_year'] if b.get('maturity_year') is not None else 9999,
+            -(b['yield_pct'] if b.get('yield_pct') is not None else -1),
+        ),
+    )
 
 
-def fetch_active_government_bonds(limit=15):
+def fetch_active_government_bonds(limit=25):
     """
     Fetch actively-traded government bonds (Treasury + Infrastructure) from
-    the NSE's most recent daily bond prices PDF, sorted by value traded
-    (highest first). Returns [] on any failure -- fails safe.
+    the NSE's most recent daily bond prices PDF, sorted by maturity (soonest
+    first) then yield (highest first). `limit` is raised from the old
+    volume-sorted default (15) since truncating a maturity-ordered list at a
+    low number would silently drop the long end of the curve -- the day's
+    actively-traded set is typically well under this anyway.
+    Returns [] on any failure -- fails safe.
     """
     try:
         pdf_url = _get_bond_pdf_url()
