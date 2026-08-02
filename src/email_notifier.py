@@ -384,6 +384,33 @@ class EmailNotifier:
         (soonest first), then by yield &mdash; for a buy-and-hold investor, how
         soon a bond matures matters more than how much traded today.
     </p>
+"""
+            from bond_data import recommend_bonds
+            picks = recommend_bonds(bonds)
+            if picks:
+                html += """
+    <div style="background:#d1fae5; border-radius:8px; padding:12px 16px; margin:0 0 16px;">
+        <div style="font-weight:700; font-size:0.85rem; color:#065f46; margin-bottom:6px;">
+            &#127942; Highest yield by time horizon
+        </div>
+"""
+                for p in picks:
+                    b = p['bond']
+                    html += (
+                        f'        <div style="font-size:0.8rem; color:#065f46; margin:2px 0;">'
+                        f'<strong>{p["label"]}:</strong> {b["issue_no"]} &mdash; '
+                        f'{b["yield_pct"]:.2f}% yield (matures {b["maturity_year"]})</div>\n'
+                    )
+                html += """
+        <div style="font-size:0.72rem; color:#065f46; margin-top:8px; opacity:0.85;">
+            Same issuer (Government of Kenya) in every bucket, so within a time
+            horizon the higher-yielding bond is the straightforward pick. This is
+            not a single "best bond overall" &mdash; that depends on when you
+            actually need the money back.
+        </div>
+    </div>
+"""
+            html += """
     <table>
         <tr><th>Bond</th><th>Maturity</th><th>Yield</th><th>Coupon</th><th>Clean Price</th><th>Value Traded (KES)</th></tr>
 """

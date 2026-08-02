@@ -31,6 +31,15 @@ that day, so the list is built for "which one fits my time horizon and
 pays the most" rather than "which one was busiest today". Value traded is
 still shown, just no longer the sort key.
 
+`recommend_bonds()` additionally picks one highlighted bond per maturity
+bucket (short/medium/long): the highest-yielding actively-traded bond in
+that bucket. Every bond here shares the same issuer (Government of Kenya),
+so credit risk is constant within a bucket -- among bonds of similar
+duration, higher yield is a straightforwardly better buy, no judgment call
+needed. It deliberately does NOT pick one single "best" bond overall,
+since the right maturity depends on the reader's own time horizon, which
+this tool has no way to know.
+
 Extraction reliability: even with Textract, individual digits in the
 ISIN/numeric columns are still sometimes misread. Two defenses:
   1. ISIN check-digit validation (ISO 6166) -- a row whose ISIN fails its
@@ -47,6 +56,8 @@ required source.
 """
 
 import re
+from datetime import datetime
+
 import requests
 
 from logger import get_logger
@@ -301,6 +312,10 @@ def fetch_active_government_bonds(limit=25):
         resp.raise_for_status()
         rows = _extract_table_rows(resp.content)
         bonds = _parse_rows(rows)
+        current_year = datetime.now().year
+        for b in bonds:
+            if b.get('maturity_year') is not None:
+                b['years_to_maturity'] = b['maturity_year'] - current_year
         logger.info(f"Bond data: {len(bonds)} actively-traded government bonds from {pdf_url}")
         return bonds[:limit]
     except Exception as e:
@@ -308,9 +323,44 @@ def fetch_active_government_bonds(limit=25):
         return []
 
 
+_MATURITY_BUCKETS = [
+    ("Short-term (up to 5 years)", lambda y: y <= 5),
+    ("Medium-term (5-15 years)", lambda y: 5 < y <= 15),
+    ("Long-term (over 15 years)", lambda y: y > 15),
+]
+
+
+def recommend_bonds(bonds):
+    """
+    Pick the single highest-yielding bond in each maturity bucket (short/
+    medium/long) -- see the module docstring for why this is a defensible
+    "which one to buy" pick within a bucket rather than a false claim of
+    knowing the single best bond overall.
+
+    Returns a list of {"label": bucket label, "bond": bond dict}, one entry
+    per bucket that has at least one candidate with a usable yield. A
+    bucket with no qualifying bond is skipped, not guessed at.
+    """
+    picks = []
+    for label, in_bucket in _MATURITY_BUCKETS:
+        candidates = [
+            b for b in bonds
+            if b.get('years_to_maturity') is not None
+            and in_bucket(b['years_to_maturity'])
+            and b.get('yield_pct') is not None
+        ]
+        if candidates:
+            picks.append({'label': label, 'bond': max(candidates, key=lambda b: b['yield_pct'])})
+    return picks
+
+
 # ---- Test ----
 if __name__ == "__main__":
     from logger import setup_logging
     setup_logging()
-    for b in fetch_active_government_bonds():
+    bonds = fetch_active_government_bonds()
+    for b in bonds:
         print(b)
+    print("\nRecommended:")
+    for p in recommend_bonds(bonds):
+        print(p)
