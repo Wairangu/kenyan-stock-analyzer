@@ -17,12 +17,15 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 # Default factor weights (must sum to 1.0). Tunable via Config.
+# Value, quality and liquidity each gave up a little weight to make room
+# for growth, a standard factor that was previously missing entirely.
 DEFAULT_WEIGHTS = {
-    "value": 0.25,
-    "quality": 0.25,
+    "value": 0.20,
+    "quality": 0.20,
+    "growth": 0.15,
     "momentum": 0.20,
     "dividend": 0.15,
-    "liquidity": 0.15,
+    "liquidity": 0.10,
 }
 
 
@@ -30,21 +33,49 @@ def _clamp(x, lo=0.0, hi=100.0):
     return max(lo, min(hi, x))
 
 
-def _score_value(fund):
-    """Lower P/E, P/B and PEG score higher. Returns (score, reasons)."""
+def _relative_to_sector(value, median):
+    """
+    Score a "lower is cheaper" metric (P/E, P/B) relative to its sector
+    median instead of a fixed anchor: 0.5x median -> 100, 1.0x (in line
+    with peers) -> ~67, 2.0x median -> 0. Returns None if no median.
+    A bank and a manufacturer shouldn't be judged against the same fixed
+    P/E number, so this is preferred whenever a sector median is available.
+    """
+    if not median or median <= 0:
+        return None
+    ratio = value / median
+    return _clamp(133.33 - 66.67 * ratio)
+
+
+def _score_value(fund, sector_medians=None):
+    """Lower P/E, P/B and PEG score higher — relative to the stock's own
+    sector when a median is available, else a fixed anchor. Returns
+    (score, reasons)."""
     parts, reasons = [], []
+    sector = fund.get("sector")
+    med = (sector_medians or {}).get(sector, {}) if sector else {}
+
     pe = fund.get("pe_ratio")
     if pe and pe > 0:
-        s = _clamp(100 - (pe - 8) * 4)  # pe 8 -> 100, pe 33 -> 0
-        parts.append(s)
-        reasons.append(f"P/E {pe:.1f}")
+        s = _relative_to_sector(pe, med.get("pe_ratio"))
+        if s is not None:
+            parts.append(s)
+            reasons.append(f"P/E {pe:.1f} (vs sector)")
+        else:
+            parts.append(_clamp(100 - (pe - 8) * 4))  # pe 8 -> 100, pe 33 -> 0
+            reasons.append(f"P/E {pe:.1f}")
     pb = fund.get("price_to_book")
     if pb and pb > 0:
-        s = _clamp(100 - (pb - 1) * 30)  # pb 1 -> 100, pb ~4.3 -> 0
-        parts.append(s)
-        reasons.append(f"P/B {pb:.2f}")
+        s = _relative_to_sector(pb, med.get("price_to_book"))
+        if s is not None:
+            parts.append(s)
+            reasons.append(f"P/B {pb:.2f} (vs sector)")
+        else:
+            parts.append(_clamp(100 - (pb - 1) * 30))  # pb 1 -> 100, pb ~4.3 -> 0
+            reasons.append(f"P/B {pb:.2f}")
     peg = fund.get("peg_ratio")
     if peg and peg > 0:
+        # No sector median tracked for PEG -- always the fixed anchor.
         s = _clamp(100 - (peg - 0.5) * 50)  # peg 0.5 -> 100, peg 2.5 -> 0
         parts.append(s)
         reasons.append(f"PEG {peg:.2f}")
@@ -74,6 +105,24 @@ def _score_quality(fund):
         reasons.append(f"current ratio {cr:.2f}")
     if not parts:
         return None, ["no quality data"]
+    return round(sum(parts) / len(parts)), reasons
+
+
+def _score_growth(fund):
+    """Higher YoY EPS/revenue growth scores higher. A standard factor
+    alongside value/quality/momentum -- rewards an expanding business
+    rather than just a cheap or a trending one."""
+    parts, reasons = [], []
+    eps_g = fund.get("eps_growth_yoy")
+    if eps_g is not None:
+        parts.append(_clamp(50 + eps_g * 2))  # +25% YoY EPS growth -> 100
+        reasons.append(f"EPS growth {eps_g:+.1f}%")
+    rev_g = fund.get("revenue_growth_yoy")
+    if rev_g is not None:
+        parts.append(_clamp(50 + rev_g * 2.5))  # +20% YoY revenue growth -> 100
+        reasons.append(f"revenue growth {rev_g:+.1f}%")
+    if not parts:
+        return None, ["no growth data"]
     return round(sum(parts) / len(parts)), reasons
 
 
@@ -145,21 +194,27 @@ def _score_liquidity(fund):
     return round(s), [f"traded KES {vt/1e6:.1f}M"]
 
 
-def score_stock(symbol, analysis_result, fund, weights=None):
+def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None):
     """
     Produce a transparent factor score for one stock.
 
     Returns dict:
-        {overall, value, quality, momentum, dividend, liquidity, reasons}
+        {overall, value, quality, growth, momentum, dividend, liquidity, reasons}
     Sub-scores are 0-100 or None when data is missing. `overall` is the
     weighted blend of the available sub-scores (weights renormalised).
+
+    `sector_medians` (optional, from market_context.compute_sector_medians)
+    lets the value factor score P/E and P/B relative to the stock's own
+    sector instead of a fixed anchor; omitted or missing-sector stocks
+    fall back to the fixed anchor automatically.
     """
     weights = weights or DEFAULT_WEIGHTS
     fund = fund or {}
 
     subs = {
-        "value": _score_value(fund),
+        "value": _score_value(fund, sector_medians),
         "quality": _score_quality(fund),
+        "growth": _score_growth(fund),
         "momentum": _score_momentum(analysis_result, fund),
         "dividend": _score_dividend(fund),
         "liquidity": _score_liquidity(fund),

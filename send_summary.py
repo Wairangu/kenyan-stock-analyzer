@@ -156,12 +156,14 @@ def main():
 
     # ---- Context, scoring, alerts ----
     usd_kes = None
+    sector_medians = {}
     try:
-        from market_context import fetch_usd_kes
+        from market_context import compute_sector_medians, fetch_usd_kes
+        sector_medians = compute_sector_medians(fundamentals_data)
         if config.enable_fx:
             usd_kes = fetch_usd_kes()
     except Exception as e:
-        logger.warning(f"FX skipped: {e}")
+        logger.warning(f"Market context skipped: {e}")
 
     scores, alerts = {}, {}
     try:
@@ -169,7 +171,7 @@ def main():
         for sym, r in analysis_results.items():
             if r:
                 f = fundamentals_data.get(sym, {})
-                scores[sym] = score_stock(sym, r, f)
+                scores[sym] = score_stock(sym, r, f, sector_medians=sector_medians)
                 a = generate_alerts(sym, r, f, validations.get(sym))
                 if a:
                     alerts[sym] = a

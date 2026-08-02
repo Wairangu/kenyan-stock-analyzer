@@ -255,7 +255,7 @@ def handler(event, context):
                 if not result:
                     continue
                 fund = fundamentals_data.get(symbol, {})
-                scores[symbol] = score_stock(symbol, result, fund)
+                scores[symbol] = score_stock(symbol, result, fund, sector_medians=sector_medians)
                 a = generate_alerts(symbol, result, fund, validations.get(symbol))
                 if a:
                     alerts[symbol] = a
