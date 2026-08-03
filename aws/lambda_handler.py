@@ -1,10 +1,15 @@
 """
 AWS Lambda entry point for the Kenyan Stock Analyzer.
 
-Mirrors main.py's pipeline call sequence for the lean, watchlist-only,
-HTML-only path (no PDF, no Excel, no per-stock detailed reports, no
-NSE-PDF-OCR fallback source), then uploads the generated dashboard to S3
-and emails an HTML summary via SES.
+Mirrors main.py's pipeline call sequence for the HTML-only path (no PDF,
+no Excel, no per-stock detailed reports, no NSE-PDF-OCR fallback source),
+then uploads the generated dashboard to S3 and emails an HTML summary via
+SES. Analyzes ALL NSE stocks (via fetch_all_stocks(), same as main.py and
+send_summary.py) -- this used to be hardcoded to a 10-stock watchlist,
+leaving ~46 NSE-listed stocks with fundamentals fetched but never scored,
+alerted, or shown on the dashboard/email. STOCK_SYMBOLS below is now only
+the last-resort fallback fetch_all_stocks() itself falls back to if both
+the TradingView scanner and the NSE PDF are unavailable.
 
 Triggered on a schedule by EventBridge (see ../terraform). See ../aws for
 the Dockerfile and build script.
@@ -182,7 +187,7 @@ def handler(event, context):
     sector_analyzer = SectorAnalyzer()
 
     logger.info("Fetching stock data...")
-    stock_data = data_acq.fetch_multiple_stocks(config.stock_symbols, period='6mo', interval='1d')
+    stock_data = data_acq.fetch_all_stocks(period='6mo', interval='1d')
     if not stock_data:
         raise RuntimeError("No stock data fetched — aborting.")
     logger.info(f"Fetched {len(stock_data)} stocks")
