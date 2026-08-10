@@ -188,6 +188,9 @@ class EmailNotifier:
                 'tv_label': tv_label,
                 'tv_class': tv_class,
                 'score': (scores or {}).get(symbol, {}).get('overall'),
+                'score_coverage': (scores or {}).get(symbol, {}).get('coverage'),
+                'score_factors': (scores or {}).get(symbol, {}).get('factors_present'),
+                'score_factors_total': (scores or {}).get(symbol, {}).get('factors_total'),
             })
 
         dashboard_button = ""
@@ -275,6 +278,8 @@ class EmailNotifier:
         .score-high {{ background-color: #d1fae5; color: #065f46; }}
         .score-mid {{ background-color: #fef3c7; color: #92400e; }}
         .score-low {{ background-color: #fee2e2; color: #991b1b; }}
+        .score.partial {{ border: 1.5px dashed currentColor; }}
+        .score-flag {{ font-size: 0.85em; }}
         .footer {{ text-align: center; padding: 16px 8px 4px; font-size: 0.78rem; color: #667085; }}
         .footer a {{ color: #2563eb; font-weight: 700; text-decoration: none; }}
     </style>
@@ -333,7 +338,7 @@ class EmailNotifier:
     <div class="card"><div class="bar"></div>
     <h2>📋 All Stocks — Signal &amp; Score</h2>
     <table>
-        <tr><th>Symbol</th><th>TV Signal</th><th>Price</th><th>Change</th><th>Score</th></tr>
+        <tr><th>Symbol</th><th>TV Signal</th><th>Price</th><th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th></tr>
 """
             for s in stocks:
                 price_str = f"{s['price']:.2f}" if s['price'] is not None else '—'
@@ -345,7 +350,13 @@ class EmailNotifier:
                     score_html = '—'
                 else:
                     sc_cls = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
-                    score_html = f'<span class="score {sc_cls}">{sc}</span>'
+                    coverage = s.get('score_coverage')
+                    partial = coverage is not None and coverage < 60
+                    cls = f'score {sc_cls} partial' if partial else f'score {sc_cls}'
+                    flag = ' <span class="score-flag">△</span>' if partial else ''
+                    title = (f' title="Based on {s.get("score_factors")}/{s.get("score_factors_total")} factors"'
+                             if partial else '')
+                    score_html = f'<span class="{cls}"{title}>{sc}{flag}</span>'
                 html += (
                     f'        <tr><td><strong>{s["symbol"]}</strong></td>'
                     f'<td><span class="badge {s["tv_class"]}">{s["tv_label"]}</span></td>'
@@ -380,9 +391,8 @@ class EmailNotifier:
     <h2>&#127974; Government Bonds &mdash; Actively Traded</h2>
     <p style="font-size:0.78rem; color:#667085; margin:0 0 12px;">
         Machine-extracted from the NSE's daily bond prices PDF &mdash; treat as
-        approximate and verify before acting on any figure. Sorted by maturity
-        (soonest first), then by yield &mdash; for a buy-and-hold investor, how
-        soon a bond matures matters more than how much traded today.
+        approximate and verify before acting on any figure. Sorted by issue
+        date (most recently issued first), then by yield.
     </p>
 """
             from bond_data import bond_market_verdict, recommend_bonds
@@ -420,20 +430,32 @@ class EmailNotifier:
 """
             html += """
     <table>
-        <tr><th>Bond</th><th>Maturity</th><th>Yield</th><th>Coupon</th><th>Clean Price</th><th>Value Traded (KES)</th></tr>
+        <tr><th>Bond</th><th>Maturity</th><th>Yield</th><th>Coupon</th>
+        <th title="Paid semi-annually. Scaled to CBK's KES 50,000 minimum subscription">Coupon Payment (per KES 50,000)</th>
+        <th>Clean Price</th><th>Value Traded (KES)</th></tr>
 """
             for b in bonds:
                 maturity = str(b['maturity_year']) if b.get('maturity_year') is not None else '—'
                 coupon = f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—'
+                cpn_pmt = (f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                           if b.get('coupon_payment_per_50k') is not None else '—')
                 yld = f"{b['yield_pct']:.2f}%" if b.get('yield_pct') is not None else '—'
                 clean = f"{b['clean_price']:.2f}" if b.get('clean_price') is not None else '—'
                 traded = f"{b['value_traded']:,.0f}" if b.get('value_traded') is not None else '—'
                 html += (
                     f'        <tr><td><strong>{b["issue_no"]}</strong></td>'
-                    f'<td>{maturity}</td><td>{yld}</td><td>{coupon}</td>'
+                    f'<td>{maturity}</td><td>{yld}</td><td>{coupon}</td><td>{cpn_pmt}</td>'
                     f'<td>{clean}</td><td>{traded}</td></tr>\n'
                 )
-            html += "    </table>\n    </div>\n"
+            html += "    </table>\n"
+            html += (
+                '    <p style="font-size:0.7rem; color:#98a2b3; margin:8px 0 0;">'
+                "Coupon Payment assumes CBK's KES 50,000 minimum subscription (Treasury/"
+                'Infrastructure bonds are bought in multiples of KES 50,000), paid twice a year '
+                '(semi-annually) &mdash; none of these series pay quarterly. Scale up for a larger '
+                'holding, e.g. double it for KES 100,000 invested.</p>\n'
+            )
+            html += "    </div>\n"
 
         footer_link = (
             f'<a href="{dashboard_url}">View the full dashboard &rarr;</a><br>'

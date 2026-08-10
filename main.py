@@ -284,6 +284,7 @@ def main():
             scores=scores,
             alerts=alerts,
             usd_kes=usd_kes,
+            bonds=bonds,
         )
 
         # ---- Email ----

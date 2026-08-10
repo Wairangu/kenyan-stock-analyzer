@@ -233,11 +233,21 @@ def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None
             den += w
     overall = round(num / den) if den > 0 else None
 
+    # Coverage: how much of the intended weight actually had data behind it.
+    # A score built from 2 of 6 factors isn't as trustworthy as one built
+    # from all 6, even though renormalization makes both look like a clean
+    # 0-100 number -- this is what lets callers flag the difference.
+    total_weight = sum(weights.values()) or 1.0
+    factors_present = sum(1 for s in scores.values() if s is not None)
+
     return {
         "symbol": symbol,
         "overall": overall,
         **scores,
         "reasons": reasons,
+        "coverage": round(100 * den / total_weight) if overall is not None else 0,
+        "factors_present": factors_present,
+        "factors_total": len(scores),
     }
 
 

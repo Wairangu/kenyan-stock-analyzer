@@ -949,7 +949,8 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
 
     def generate_index(self, analysis_results, sector_data=None, breadth=None,
                        report_files=None, fundamentals_data=None,
-                       validations=None, scores=None, alerts=None, usd_kes=None):
+                       validations=None, scores=None, alerts=None, usd_kes=None,
+                       bonds=None):
         """
         Generate the main index.html dashboard — the single entry point.
 
@@ -1020,8 +1021,12 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
                 'dividend_type': fund.get('dividend_type'),
                 # Next earnings date (used by the Next Earnings page)
                 'earnings_next_date': fund.get('earnings_next_date'),
-                # Transparent factor score (0-100)
+                # Transparent factor score (0-100), plus how much of the
+                # factor weight actually had data behind it -- see score_td.
                 'score': (scores or {}).get(symbol, {}).get('overall'),
+                'score_coverage': (scores or {}).get(symbol, {}).get('coverage'),
+                'score_factors': (scores or {}).get(symbol, {}).get('factors_present'),
+                'score_factors_total': (scores or {}).get(symbol, {}).get('factors_total'),
                 # Price validation (independent cross-check + freshness)
                 'validation': (validations or {}).get(symbol, {}),
             }
@@ -1059,7 +1064,7 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
             stocks=stocks, gainers=gainers, losers=losers, sectors=sector_data,
             breadth=breadth, sector_chart=sector_chart, bullish=bullish,
             bearish=bearish, neutral=neutral, total=len(stocks),
-            data_date=data_date, alerts=alerts, usd_kes=usd_kes,
+            data_date=data_date, alerts=alerts, usd_kes=usd_kes, bonds=bonds,
         )
         return index_path
 
@@ -1069,6 +1074,7 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
         ('technicals.html', '📈 Technicals'),
         ('fundamentals.html', '💰 Fundamentals'),
         ('dividends.html', '💵 Dividends'),
+        ('bonds.html', '🏛️ Bonds'),
         ('earnings.html', '📅 Next Earnings'),
         ('sectors.html', '📊 Sectors'),
         ('foreign.html', '🌍 Foreign Flows'),
@@ -1355,6 +1361,8 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
 .score-high { background: #d1fae5; color: #065f46; }
 .score-mid { background: #fef3c7; color: #92400e; }
 .score-low { background: #fee2e2; color: #991b1b; }
+.score.partial { border: 1.5px dashed currentColor; cursor: help; }
+.score-flag { font-size: 0.85em; vertical-align: text-top; }
 .pv-mark { font-size: 0.78rem; cursor: help; margin-left: 2px; }
 /* Dividend */
 .div-pay, .div-unverified, .div-zero, .exdate-upcoming, .exdate-past, .cal-chip,
@@ -1691,6 +1699,142 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
         return ('<div class="section"><h2>📖 What these numbers mean (plain English)</h2>'
                 '<p class="page-intro">No accounting needed — here is each column explained simply, '
                 'with an example and what counts as a good value.</p>'
+                f'<div class="explain-grid">{items}</div></div>')
+
+    def _build_bonds_body(self, bonds):
+        """
+        Build the Government Bonds page — actively-traded NSE Treasury/
+        Infrastructure bonds from bond_data.fetch_active_government_bonds(),
+        sorted most-recently-issued first. Mirrors the daily email's bonds
+        section (verdict + per-horizon picks + table) with the dashboard's
+        own styling, plus a plain-English glossary.
+        """
+        if not bonds:
+            return (
+                '<p class="page-intro">Actively-traded government bonds on the NSE '
+                '(Treasury + Infrastructure), machine-extracted from the NSE\'s daily '
+                'bond prices PDF.</p>'
+                '<div class="section"><h2>🏛️ Government Bonds</h2>'
+                '<div class="dq-note dq-mismatch">⚠️ No bond data available for this run '
+                '(the NSE bond prices PDF may not be published yet, or extraction failed — '
+                'this section fails safe rather than showing a stale or guessed figure).</div>'
+                '</div>'
+            )
+
+        from bond_data import bond_market_verdict, recommend_bonds
+
+        verdict_html = ''
+        try:
+            verdict = bond_market_verdict(bonds)
+        except Exception as e:
+            logger.warning(f"Bonds page: verdict unavailable: {e}")
+            verdict = None
+        if verdict:
+            badge_class = {'buy': 'buy', 'hold': 'neutral', 'avoid': 'sell'}[verdict['verdict']]
+            verdict_html = (
+                '<div class="section"><h2>🎯 Is now a good time to buy bonds?</h2>'
+                f'<p><span class="badge {badge_class}">{verdict["label"]}</span> '
+                f'<span style="color:#475569;">{verdict["reason"]}</span></p></div>'
+            )
+
+        picks_html = ''
+        picks = recommend_bonds(bonds)
+        if picks:
+            cards = ''.join(
+                f'<div class="stat-card"><div class="stat-value" style="font-size:1.05rem;">{p["bond"]["issue_no"]}</div>'
+                f'<div class="stat-label">{p["label"]}<br>{p["bond"]["yield_pct"]:.2f}% yield · '
+                f'matures {p["bond"]["maturity_year"]}</div></div>'
+                for p in picks
+            )
+            picks_html = (
+                '<div class="section"><h2>🏆 Highest yield by time horizon</h2>'
+                f'<div class="stats">{cards}</div>'
+                '<div class="dq-note">Same issuer (Government of Kenya) in every bucket, so within a '
+                'time horizon the higher-yielding bond is the straightforward pick. This is not a '
+                'single "best bond overall" — that depends on when you actually need the money back.</div></div>'
+            )
+
+        rows = ''.join(
+            '<tr><td><strong>{issue_no}</strong></td><td>{issued}</td><td>{maturity}</td>'
+            '<td>{yld}</td><td>{coupon}</td><td>{cpn_pmt}</td><td>{clean}</td><td>{traded}</td></tr>'.format(
+                issue_no=b['issue_no'],
+                issued=b['issue_year'] if b.get('issue_year') is not None else '—',
+                maturity=b['maturity_year'] if b.get('maturity_year') is not None else '—',
+                yld=f"{b['yield_pct']:.2f}%" if b.get('yield_pct') is not None else '—',
+                coupon=f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—',
+                cpn_pmt=(f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                         if b.get('coupon_payment_per_50k') is not None else '—'),
+                clean=f"{b['clean_price']:.2f}" if b.get('clean_price') is not None else '—',
+                traded=f"KES {b['value_traded']:,.0f}" if b.get('value_traded') is not None else '—',
+            )
+            for b in bonds
+        )
+        table_html = (
+            '<div class="section"><h2>📋 Actively Traded Government Bonds</h2>'
+            '<div class="filter-bar"><input type="text" id="search" '
+            'placeholder="🔍 Filter by bond..." oninput="filterTable()"></div>'
+            '<div class="table-wrap"><table id="mainTable"><thead><tr>'
+            '<th>Bond</th><th>Issued</th><th>Maturity</th><th>Yield</th><th>Coupon</th>'
+            '<th title="Paid semi-annually. Scaled to CBK\'s KES 50,000 minimum subscription">'
+            'Coupon Payment (per KES 50,000)</th>'
+            '<th>Clean Price</th><th>Value Traded</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table></div>'
+            '<div class="dq-note">Sorted by issue date, most recently issued first, then by yield. '
+            "Coupon Payment assumes CBK's KES 50,000 minimum subscription (Treasury/Infrastructure "
+            'bonds are bought in multiples of KES 50,000) — scale up for a larger holding, e.g. '
+            "double it for KES 100,000 invested. Machine-extracted from the NSE's daily bond prices "
+            'PDF (AWS Textract table extraction) — treat as approximate and verify before acting on '
+            'any figure.</div></div>'
+        )
+
+        return (
+            '<p class="page-intro">Government bonds (Treasury + Infrastructure) that actually '
+            "traded on the NSE the previous session, newest issue first.</p>"
+            + verdict_html + picks_html + table_html + self._bonds_glossary()
+        )
+
+    def _bonds_glossary(self):
+        """Plain-English guide for Government Bonds terms."""
+        cards = [
+            ("Coupon rate",
+             "The fixed annual interest rate the bond pays, as a % of its KES 100 face value.",
+             "13.44% coupon → the bond pays KES 13.44 a year for every KES 100 of face value, "
+             "split into two payments."),
+            ("Coupon payment",
+             "The actual cash paid out each period. NSE Treasury/Infrastructure bonds pay "
+             "semi-annually (twice a year), so each payment is half the annual coupon rate. "
+             "Shown here per CBK's KES 50,000 minimum subscription, not the KES 100 pricing "
+             "unit, since nobody actually holds KES 100 of a bond.",
+             "13.44% coupon on a KES 50,000 holding → KES 3,360 every six months "
+             "(KES 6.72 per KES 100 nominal × 500)."),
+            ("Yield",
+             "The return you'd actually earn buying at today's market price, unlike the coupon "
+             "rate which is fixed to the face value.",
+             "A bond trading below par (clean price 92) yields more than its coupon rate, since "
+             "you collect the same coupon on a cheaper purchase price."),
+            ("Clean price",
+             "The quoted trading price per KES 100 face value, excluding interest accrued since "
+             "the last coupon.",
+             "Clean price 98.50 → about KES 98.50 per KES 100 of face value, plus accrued "
+             "interest (the 'dirty' price) if bought between coupon dates."),
+            ("Maturity",
+             "The year the government repays the bond's full face value.",
+             "A bond maturing in 2033 returns your KES 100 principal in 2033, on top of every "
+             "coupon paid along the way."),
+            ("Why sorted by issue date",
+             "Newest issues are listed first so you can see what the government is currently "
+             "offering, rather than burying recent issuance under older, thinly-traded series.",
+             "A bond issued in 2026 appears above one issued in 2018, even if the 2018 bond "
+             "matures sooner."),
+        ]
+        items = ''
+        for title, what, eg in cards:
+            items += (f'<div class="explain-card"><h4>{title}</h4>'
+                      f'<p>{what}</p>'
+                      f'<p class="eg">📌 <strong>Example:</strong> {eg}</p></div>')
+        return ('<div class="section"><h2>📖 What these terms mean (plain English)</h2>'
+                '<p class="page-intro">No finance degree needed — each term explained simply, '
+                'with a worked example.</p>'
                 f'<div class="explain-grid">{items}</div></div>')
 
     def _build_foreign_flows_body(self, sym_td):
@@ -2078,7 +2222,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
 
     def _build_dashboard_pages(self, stocks, gainers, losers, sectors, breadth,
                                sector_chart, bullish, bearish, neutral, total,
-                               data_date=None, alerts=None, usd_kes=None):
+                               data_date=None, alerts=None, usd_kes=None, bonds=None):
         """
         Build the multi-page dashboard: a clean Overview plus grouped detail
         pages (Technicals, Fundamentals, Dividends, Sectors, Data Quality).
@@ -2119,7 +2263,16 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             if sc is None:
                 return '<td>—</td>'
             c = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
-            return f'<td><span class="score {c}">{sc}</span></td>'
+            coverage = s.get('score_coverage')
+            fp, ft = s.get('score_factors'), s.get('score_factors_total')
+            # Below 60% weight-coverage, the score leans on too few factors
+            # to trust at face value -- flag it rather than show a clean number.
+            partial = coverage is not None and coverage < 60
+            cls = f'score {c} partial' if partial else f'score {c}'
+            title = (f' title="Based on {fp}/{ft} factors ({coverage}% of factor weight had data)"'
+                     if fp is not None else '')
+            flag = ' <span class="score-flag">△</span>' if partial else ''
+            return f'<td><span class="{cls}"{title}>{sc}{flag}</span></td>'
 
         def sym_td(s):
             link = s['report_file'] if s['report_file'] else '#'
@@ -2170,7 +2323,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             + search_bar +
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
             '<th>Symbol</th><th title="TradingView Buy/Sell rating">TV Signal</th><th>Price</th>'
-            '<th>Change</th><th title="0-100 factor screen">Score</th>'
+            '<th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
             f'</tr></thead><tbody>{ov_rows}</tbody></table></div></div>')
 
         # ---- TECHNICALS page ----
@@ -2232,7 +2385,8 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             '<th title="P/E adjusted for growth">PEG</th><th title="Price / Book value">P/B</th>'
             '<th title="Earnings per share">EPS</th><th title="Return on Equity">ROE</th>'
             '<th title="Net profit margin">Net Margin</th><th title="Debt / Equity">D/E</th>'
-            '<th title="Revenue growth vs last year">Rev Growth</th><th>Yield</th><th>Score</th>'
+            '<th title="Revenue growth vs last year">Rev Growth</th><th>Yield</th>'
+            '<th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
             f'</tr></thead><tbody>{fund_rows}</tbody></table></div></div>'
             + self._fundamentals_explainer())
 
@@ -2449,7 +2603,8 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             + search_bar +
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
             '<th>Symbol</th><th>Earnings Date</th><th>When</th>'
-            '<th>Price</th><th>Change</th><th>TV Signal</th><th>Score</th>'
+            '<th>Price</th><th>Change</th><th>TV Signal</th>'
+            '<th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
             f'</tr></thead><tbody>{earnings_rows}</tbody></table></div>'
             f'<div class="dq-note">{len(earnings_rows_raw)} stock(s) with an upcoming '
             'earnings release. Earnings dates are only published for a subset of NSE stocks; '
@@ -2460,6 +2615,9 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             'Events include 24-hour and 1-hour reminders. The daily email attaches this file automatically — '
             'in Gmail you can also click "Add to calendar" directly on the message.</div>'
             '</div>')
+
+        # ---- GOVERNMENT BONDS page ----
+        bonds_body = self._build_bonds_body(bonds)
 
         # ---- FOREIGN FLOWS page (manual weekly input) ----
         foreign_body = self._build_foreign_flows_body(sym_td)
@@ -2477,6 +2635,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             'technicals.html': self._page_shell('NSE — Technicals', 'technicals.html', subtitle, technicals_body, with_filter=True),
             'fundamentals.html': self._page_shell('NSE — Fundamentals', 'fundamentals.html', subtitle, fundamentals_body, with_filter=True),
             'dividends.html': self._page_shell('NSE — Dividends', 'dividends.html', subtitle, dividends_body, with_filter=True),
+            'bonds.html': self._page_shell('NSE — Government Bonds', 'bonds.html', subtitle, bonds_body, with_filter=True),
             'earnings.html': self._page_shell('NSE — Next Earnings', 'earnings.html', subtitle, earnings_body, with_filter=True),
             'sectors.html': self._page_shell('NSE — Sectors', 'sectors.html', subtitle, sectors_body),
             'foreign.html': self._page_shell('NSE — Foreign Flows', 'foreign.html', subtitle, foreign_body),

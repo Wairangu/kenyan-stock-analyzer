@@ -24,12 +24,9 @@ section are excluded. A bond counts as "traded" when it has a real value
 traded for the day, not just an outstanding listing -- most of the ~150
 listed bonds don't trade on any given day.
 
-Sorted by maturity (soonest first), then by yield (highest first) within
-the same maturity year. For a buy-and-hold retail reader, how soon a bond
-matures (duration/interest-rate risk) matters more than how much traded
-that day, so the list is built for "which one fits my time horizon and
-pays the most" rather than "which one was busiest today". Value traded is
-still shown, just no longer the sort key.
+Sorted by issue date, most recently issued first (then by yield, highest
+first, as a tiebreaker within the same issue year). Value traded is shown
+but is not the sort key.
 
 `recommend_bonds()` additionally picks one highlighted bond per maturity
 bucket (short/medium/long): the highest-yielding actively-traded bond in
@@ -240,12 +237,30 @@ def _row_to_bond(row):
     tenor_years = float(issue_m.group(3))
     maturity_year = issue_year + round(tenor_years)
 
+    coupon_pct = _num(row.get(_COL_COUPON), _PLAUSIBLE['coupon'])
+    # NSE-quoted Treasury/Infrastructure bonds are priced per KES 100 nominal
+    # (hence clean/dirty prices sitting in the 50-160 range) and pay
+    # semi-annually, so the per-100 coupon payment is just half the annual
+    # coupon rate. There's no quarterly-paying series on this market.
+    coupon_payment_semi_annual = round(coupon_pct / 2, 2) if coupon_pct is not None else None
+    # KES 100 nominal is the pricing/quoting unit, not a realistic holding --
+    # nobody buys KES 100 of a bond. CBK's minimum subscription for Treasury
+    # and Infrastructure bonds is KES 50,000 (in multiples of 50,000
+    # thereafter), so scale the payment to that for a figure that actually
+    # matches what a real investor would receive.
+    coupon_payment_per_50k = (
+        round(coupon_payment_semi_annual * 500, 2) if coupon_payment_semi_annual is not None else None
+    )
+
     return {
         'issue_no': issue_no,
         'isin': m.group(),
+        'issue_year': issue_year,
         'tenor_years': tenor_years,
         'maturity_year': maturity_year,
-        'coupon_pct': _num(row.get(_COL_COUPON), _PLAUSIBLE['coupon']),
+        'coupon_pct': coupon_pct,
+        'coupon_payment_semi_annual': coupon_payment_semi_annual,
+        'coupon_payment_per_50k': coupon_payment_per_50k,
         'yield_pct': _num(row.get(_COL_YIELD), _PLAUSIBLE['yield']),
         'clean_price': _num(row.get(_COL_CLEAN), _PLAUSIBLE['clean']),
         'previous_price': _num(row.get(_COL_PREVIOUS), _PLAUSIBLE['previous']),
@@ -290,13 +305,13 @@ def _parse_rows(rows):
         if not existing or (b['value_traded'] or 0) > (existing['value_traded'] or 0):
             by_isin[b['isin']] = b
 
-    # Soonest-maturing first (duration risk), then highest yield first among
-    # bonds maturing in the same year. Missing values sort last within their
-    # tier rather than crashing the comparison.
+    # Most recently issued first, then highest yield first among bonds
+    # issued in the same year. Missing values sort last within their tier
+    # rather than crashing the comparison.
     return sorted(
         by_isin.values(),
         key=lambda b: (
-            b['maturity_year'] if b.get('maturity_year') is not None else 9999,
+            -(b['issue_year'] if b.get('issue_year') is not None else -9999),
             -(b['yield_pct'] if b.get('yield_pct') is not None else -1),
         ),
     )
@@ -305,11 +320,11 @@ def _parse_rows(rows):
 def fetch_active_government_bonds(limit=25):
     """
     Fetch actively-traded government bonds (Treasury + Infrastructure) from
-    the NSE's most recent daily bond prices PDF, sorted by maturity (soonest
-    first) then yield (highest first). `limit` is raised from the old
-    volume-sorted default (15) since truncating a maturity-ordered list at a
-    low number would silently drop the long end of the curve -- the day's
-    actively-traded set is typically well under this anyway.
+    the NSE's most recent daily bond prices PDF, sorted by issue date (most
+    recently issued first) then yield (highest first). `limit` is raised
+    from the old volume-sorted default (15) since truncating the list at a
+    low number would silently drop older issues -- the day's actively-traded
+    set is typically well under this anyway.
     Returns [] on any failure -- fails safe.
     """
     try:

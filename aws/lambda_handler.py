@@ -277,6 +277,7 @@ def handler(event, context):
         analysis_results, sector_data=sector_data, breadth=breadth,
         report_files={}, fundamentals_data=fundamentals_data,
         validations=validations, scores=scores, alerts=alerts, usd_kes=usd_kes,
+        bonds=bonds,
     )
 
     notifier = EmailNotifier(config)  # only generate_email_body() is used — SMTP fields are unused here
