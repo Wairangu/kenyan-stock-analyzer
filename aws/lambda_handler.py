@@ -241,6 +241,13 @@ def handler(event, context):
     except Exception as e:
         logger.warning(f"Bond data skipped: {e}")
 
+    cbk_auctions = []
+    try:
+        from cbk_auctions import fetch_open_treasury_auctions
+        cbk_auctions = fetch_open_treasury_auctions()
+    except Exception as e:
+        logger.warning(f"CBK auctions skipped: {e}")
+
     sector_medians = {}
     usd_kes = None
     try:
@@ -277,7 +284,7 @@ def handler(event, context):
         analysis_results, sector_data=sector_data, breadth=breadth,
         report_files={}, fundamentals_data=fundamentals_data,
         validations=validations, scores=scores, alerts=alerts, usd_kes=usd_kes,
-        bonds=bonds,
+        bonds=bonds, cbk_auctions=cbk_auctions,
     )
 
     notifier = EmailNotifier(config)  # only generate_email_body() is used — SMTP fields are unused here
@@ -285,6 +292,7 @@ def handler(event, context):
     email_body = notifier.generate_email_body(
         analysis_results, sector_data, breadth, dashboard_url=dashboard_url,
         fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
+        cbk_auctions=cbk_auctions,
     )
     subject = f"NSE Daily Report — {datetime.now():%Y-%m-%d}"
 

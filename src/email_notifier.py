@@ -124,7 +124,8 @@ class EmailNotifier:
 
     def generate_email_body(self, analysis_results, sector_data=None,
                             breadth=None, dashboard_url=None,
-                            fundamentals_data=None, scores=None, bonds=None):
+                            fundamentals_data=None, scores=None, bonds=None,
+                            cbk_auctions=None):
         """
         Generate a compact HTML email body with market summary.
 
@@ -153,6 +154,14 @@ class EmailNotifier:
                 previous session. Section is omitted entirely when empty
                 (most days won't have this if bond_data's PDF extraction
                 fails -- it fails safe, not required for the email to send).
+            cbk_auctions: list of dicts from
+                cbk_auctions.fetch_open_treasury_auctions(), bonds CBK
+                currently has open for primary-market auction (buy
+                directly from the government via DhowCSD, not the NSE).
+                Rendered as its own section above the NSE bonds table
+                since it's a different market; omitted entirely when
+                empty (no auction open right now, which is most days --
+                each one is only open ~2 weeks).
 
         Returns:
             HTML string suitable for email clients.
@@ -384,11 +393,48 @@ class EmailNotifier:
                 )
             html += "    </table>\n    </div>\n"
 
+        # Bonds CBK currently has open for primary-market auction (buy directly
+        # from the government via DhowCSD -- a different market from the NSE
+        # secondary-market table below, so kept as its own section).
+        if cbk_auctions:
+            closes_at = cbk_auctions[0].get('sale_closes', '')
+            html += f"""
+    <div class="card"><div class="bar"></div>
+    <h2>&#127881; Currently Open for Auction &mdash; CBK Primary Market</h2>
+    <p style="font-size:0.78rem; color:#667085; margin:0 0 12px;">
+        Buy these directly from the government via
+        <a href="https://dhowcsd.centralbank.go.ke/">DhowCSD</a> &mdash; not through a
+        stockbroker. This auction closes <strong>{closes_at}</strong>.
+    </p>
+    <table>
+        <tr><th>Bond</th><th>Coupon</th><th>Maturity</th>
+        <th title="Paid semi-annually. Scaled to CBK's KES 50,000 minimum subscription">Coupon Payment (per KES 50,000)</th>
+        <th>Sale Closes</th></tr>
+"""
+            for b in cbk_auctions:
+                coupon = f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—'
+                cpn_pmt = (f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                           if b.get('coupon_payment_per_50k') is not None else '—')
+                html += (
+                    f'        <tr><td><strong>{b["issue_no"]}</strong></td><td>{coupon}</td>'
+                    f'<td>{b.get("maturity_date", "—")}</td><td>{cpn_pmt}</td>'
+                    f'<td>{b.get("sale_closes", "—")}</td></tr>\n'
+                )
+            html += "    </table>\n"
+            html += (
+                '    <p style="font-size:0.7rem; color:#98a2b3; margin:8px 0 0;">'
+                "Scraped from CBK's Treasury Bonds prospectus PDF &mdash; verify on "
+                '<a href="https://www.centralbank.go.ke/bills-bonds/treasury-bonds/">CBK\'s site</a> '
+                'or the DhowCSD portal before bidding. Switch auctions (exchanging a bond you '
+                'already hold) are not shown here.</p>\n'
+            )
+            html += "    </div>\n"
+
         # Government bonds actively traded on the NSE (Treasury + Infrastructure)
         if bonds:
             html += """
     <div class="card"><div class="bar"></div>
-    <h2>&#127974; Government Bonds &mdash; Actively Traded</h2>
+    <h2>&#127974; Government Bonds &mdash; Actively Traded on NSE (Secondary Market)</h2>
     <p style="font-size:0.78rem; color:#667085; margin:0 0 12px;">
         Machine-extracted from the NSE's daily bond prices PDF &mdash; treat as
         approximate and verify before acting on any figure. Sorted by issue

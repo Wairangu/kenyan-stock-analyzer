@@ -950,7 +950,7 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
     def generate_index(self, analysis_results, sector_data=None, breadth=None,
                        report_files=None, fundamentals_data=None,
                        validations=None, scores=None, alerts=None, usd_kes=None,
-                       bonds=None):
+                       bonds=None, cbk_auctions=None):
         """
         Generate the main index.html dashboard — the single entry point.
 
@@ -1065,6 +1065,7 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
             breadth=breadth, sector_chart=sector_chart, bullish=bullish,
             bearish=bearish, neutral=neutral, total=len(stocks),
             data_date=data_date, alerts=alerts, usd_kes=usd_kes, bonds=bonds,
+            cbk_auctions=cbk_auctions,
         )
         return index_path
 
@@ -1701,25 +1702,88 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
                 'with an example and what counts as a good value.</p>'
                 f'<div class="explain-grid">{items}</div></div>')
 
-    def _build_bonds_body(self, bonds):
+    def _build_cbk_auctions_html(self, cbk_auctions):
         """
-        Build the Government Bonds page — actively-traded NSE Treasury/
-        Infrastructure bonds from bond_data.fetch_active_government_bonds(),
-        sorted most-recently-issued first. Mirrors the daily email's bonds
-        section (verdict + per-horizon picks + table) with the dashboard's
-        own styling, plus a plain-English glossary.
+        'Currently Open for Auction' section — bonds CBK is selling right
+        now via DhowCSD (primary market: brand-new bonds, bought directly
+        from the government). Kept separate from the NSE table below
+        (secondary market: bonds already issued, trading between
+        investors via a stockbroker) since they're different markets
+        answering different questions.
         """
-        if not bonds:
+        def _fmt_date(iso):
+            if not iso:
+                return '—'
+            try:
+                return datetime.strptime(iso, '%Y-%m-%d').strftime('%d %b %Y')
+            except ValueError:
+                return iso
+
+        if not cbk_auctions:
             return (
-                '<p class="page-intro">Actively-traded government bonds on the NSE '
-                '(Treasury + Infrastructure), machine-extracted from the NSE\'s daily '
-                'bond prices PDF.</p>'
-                '<div class="section"><h2>🏛️ Government Bonds</h2>'
+                '<div class="section"><h2>🆕 Currently Open for Auction — CBK Primary Market</h2>'
+                '<div class="dq-note">No CBK Treasury/Infrastructure bond auction is open right '
+                'now. CBK auctions new bonds roughly monthly, each open for about two weeks — '
+                'check back, or see <a href="https://www.centralbank.go.ke/bills-bonds/treasury-bonds/" '
+                'target="_blank">CBK\'s Treasury Bonds page</a> directly.</div></div>'
+            )
+
+        rows = ''.join(
+            '<tr><td><strong>{issue_no}</strong></td><td>{coupon}</td><td>{maturity}</td>'
+            '<td>{cpn_pmt}</td><td>{closes}</td></tr>'.format(
+                issue_no=b['issue_no'],
+                coupon=f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—',
+                maturity=_fmt_date(b.get('maturity_date')),
+                cpn_pmt=(f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                         if b.get('coupon_payment_per_50k') is not None else '—'),
+                closes=_fmt_date(b.get('sale_closes')),
+            )
+            for b in cbk_auctions
+        )
+        closes_at = _fmt_date(cbk_auctions[0].get('sale_closes'))
+        return (
+            '<div class="section"><h2>🆕 Currently Open for Auction — CBK Primary Market</h2>'
+            '<p style="font-size:0.85rem; color:#475569; margin:0 0 12px;">Buy these directly '
+            'from the government via <a href="https://dhowcsd.centralbank.go.ke/" target="_blank" '
+            f'style="color:#3b82f6; font-weight:600;">DhowCSD</a> — not through a stockbroker. '
+            f'This auction closes <strong>{closes_at}</strong>.</p>'
+            '<div class="table-wrap"><table><thead><tr>'
+            '<th>Bond</th><th>Coupon</th><th>Maturity</th>'
+            '<th title="Paid semi-annually. Scaled to CBK\'s KES 50,000 minimum subscription">'
+            'Coupon Payment (per KES 50,000)</th><th>Sale Closes</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table></div>'
+            '<div class="dq-note">Scraped from CBK\'s Treasury Bonds prospectus PDF — verify on '
+            '<a href="https://www.centralbank.go.ke/bills-bonds/treasury-bonds/" target="_blank">'
+            "CBK's site</a> or the DhowCSD portal before bidding. Switch auctions (exchanging a "
+            'bond you already hold) are not shown here — only regular cash-sale auctions open to '
+            'new investors.</div></div>'
+        )
+
+    def _build_bonds_body(self, bonds, cbk_auctions=None):
+        """
+        Build the Government Bonds page:
+          1. Currently Open for Auction — CBK primary market.
+          2. Actively Traded on NSE — secondary market, from
+             bond_data.fetch_active_government_bonds(), sorted
+             most-recently-issued first (verdict + per-horizon picks +
+             table, mirroring the daily email's bonds section).
+        Plus a plain-English glossary at the bottom.
+        """
+        cbk_html = self._build_cbk_auctions_html(cbk_auctions)
+        page_intro = (
+            '<p class="page-intro">Government bonds (Treasury + Infrastructure) — what CBK '
+            "currently has open for auction, and what's actively trading on the NSE.</p>"
+        )
+
+        if not bonds:
+            nse_html = (
+                '<div class="section"><h2>📋 Actively Traded on NSE (Secondary Market)</h2>'
                 '<div class="dq-note dq-mismatch">⚠️ No bond data available for this run '
                 '(the NSE bond prices PDF may not be published yet, or extraction failed — '
                 'this section fails safe rather than showing a stale or guessed figure).</div>'
                 '</div>'
             )
+            return page_intro + cbk_html + nse_html + self._bonds_glossary()
 
         from bond_data import bond_market_verdict, recommend_bonds
 
@@ -1770,7 +1834,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             for b in bonds
         )
         table_html = (
-            '<div class="section"><h2>📋 Actively Traded Government Bonds</h2>'
+            '<div class="section"><h2>📋 Actively Traded on NSE (Secondary Market)</h2>'
             '<div class="filter-bar"><input type="text" id="search" '
             'placeholder="🔍 Filter by bond..." oninput="filterTable()"></div>'
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
@@ -1788,14 +1852,25 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
         )
 
         return (
-            '<p class="page-intro">Government bonds (Treasury + Infrastructure) that actually '
-            "traded on the NSE the previous session, newest issue first.</p>"
-            + verdict_html + picks_html + table_html + self._bonds_glossary()
+            page_intro + cbk_html + verdict_html + picks_html + table_html
+            + self._bonds_glossary()
         )
 
     def _bonds_glossary(self):
         """Plain-English guide for Government Bonds terms."""
         cards = [
+            ("Primary vs. secondary market",
+             "Primary market (CBK auction) = brand-new bonds bought directly from the "
+             "government via DhowCSD, only open for about two weeks at a time. Secondary "
+             "market (NSE) = existing bonds bought from another investor via a stockbroker, "
+             "tradeable any day the market's open.",
+             "Missed the CBK auction window? You can usually still buy the same bond later "
+             "on the NSE, just at whatever price/yield the market is offering that day."),
+            ("DhowCSD",
+             "CBK's own online portal for buying Treasury/Infrastructure bonds directly at "
+             "auction, without going through a stockbroker.",
+             "You'd register a CSD account at dhowcsd.centralbank.go.ke to bid on a currently-"
+             "open auction like the one above."),
             ("Coupon rate",
              "The fixed annual interest rate the bond pays, as a % of its KES 100 face value.",
              "13.44% coupon → the bond pays KES 13.44 a year for every KES 100 of face value, "
@@ -2222,7 +2297,8 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
 
     def _build_dashboard_pages(self, stocks, gainers, losers, sectors, breadth,
                                sector_chart, bullish, bearish, neutral, total,
-                               data_date=None, alerts=None, usd_kes=None, bonds=None):
+                               data_date=None, alerts=None, usd_kes=None, bonds=None,
+                               cbk_auctions=None):
         """
         Build the multi-page dashboard: a clean Overview plus grouped detail
         pages (Technicals, Fundamentals, Dividends, Sectors, Data Quality).
@@ -2617,7 +2693,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             '</div>')
 
         # ---- GOVERNMENT BONDS page ----
-        bonds_body = self._build_bonds_body(bonds)
+        bonds_body = self._build_bonds_body(bonds, cbk_auctions)
 
         # ---- FOREIGN FLOWS page (manual weekly input) ----
         foreign_body = self._build_foreign_flows_body(sym_td)

@@ -192,6 +192,15 @@ def main():
         except Exception as e:
             logger.warning(f"Bond data skipped: {e}")
 
+        # ---- Bonds currently open for CBK primary-market auction ----
+        cbk_auctions = []
+        try:
+            from cbk_auctions import fetch_open_treasury_auctions
+            logger.info("Fetching CBK Treasury bond auctions...")
+            cbk_auctions = fetch_open_treasury_auctions()
+        except Exception as e:
+            logger.warning(f"CBK auctions skipped: {e}")
+
         # ---- Market context: sector medians + USD/KES ----
         sector_medians = {}
         usd_kes = None
@@ -285,6 +294,7 @@ def main():
             alerts=alerts,
             usd_kes=usd_kes,
             bonds=bonds,
+            cbk_auctions=cbk_auctions,
         )
 
         # ---- Email ----
@@ -296,6 +306,7 @@ def main():
                 body = notifier.generate_email_body(
                     analysis_results, sector_data, breadth,
                     fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
+                    cbk_auctions=cbk_auctions,
                 )
                 notifier.send_report(
                     f"NSE Daily Report — {analysis_date.strftime('%Y-%m-%d')}",
