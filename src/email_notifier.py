@@ -341,15 +341,21 @@ class EmailNotifier:
         </div>"""
             html += "\n    </div>\n    </div>\n"
 
-        # All stocks — signal & score
-        if stocks:
+        # Buy/Sell calls only — Neutral and N/A (no analyst coverage) are
+        # dropped from the email since they're not actionable; the full
+        # list with every stock is still on the dashboard.
+        actionable_stocks = [
+            s for s in stocks
+            if s['tv_class'] in ('strong_buy', 'buy', 'sell', 'strong_sell')
+        ]
+        if actionable_stocks:
             html += """
     <div class="card"><div class="bar"></div>
-    <h2>📋 All Stocks — Signal &amp; Score</h2>
+    <h2>📋 Buy &amp; Sell Signals</h2>
     <table>
         <tr><th>Symbol</th><th>TV Signal</th><th>Price</th><th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th></tr>
 """
-            for s in stocks:
+            for s in actionable_stocks:
                 price_str = f"{s['price']:.2f}" if s['price'] is not None else '—'
                 chg = s['change']
                 chg_cls = 'bullish' if (chg or 0) >= 0 else 'bearish'
