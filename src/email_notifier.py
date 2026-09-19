@@ -341,17 +341,17 @@ class EmailNotifier:
         </div>"""
             html += "\n    </div>\n    </div>\n"
 
-        # Buy/Sell calls only — Neutral and N/A (no analyst coverage) are
-        # dropped from the email since they're not actionable; the full
-        # list with every stock is still on the dashboard.
+        # Strong Buy/Strong Sell calls only — everything else (Buy, Sell,
+        # Neutral, N/A) is dropped from the email as not conviction-worthy;
+        # the full list with every stock is still on the dashboard.
         actionable_stocks = [
             s for s in stocks
-            if s['tv_class'] in ('strong_buy', 'buy', 'sell', 'strong_sell')
+            if s['tv_class'] in ('strong_buy', 'strong_sell')
         ]
         if actionable_stocks:
             html += """
     <div class="card"><div class="bar"></div>
-    <h2>📋 Buy &amp; Sell Signals</h2>
+    <h2>📋 Strong Buy &amp; Strong Sell Signals</h2>
     <table>
         <tr><th>Symbol</th><th>TV Signal</th><th>Price</th><th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th></tr>
 """
