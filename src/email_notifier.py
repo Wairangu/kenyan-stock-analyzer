@@ -121,146 +121,327 @@ class EmailNotifier:
             logger.error(f"Failed to send email: {e}")
             return False
 
-    def generate_email_body(self, analysis_results, sector_data=None,
-                            breadth=None):
+    def generate_email_body(self, dashboard_url=None, candidates=None,
+                            track_record=None, bonds=None, cbk_auctions=None):
         """
-        Generate a compact HTML email body with market summary.
+        Generate a short "what to buy today" HTML email -- not the full
+        dashboard. Just today's ranked Buy/Strong Buy candidates (see
+        src/recommender.py), how the system's past calls have actually
+        performed (src/track_record.py), and the fixed-income sections
+        (CBK auctions / NSE bonds), which are a separate concern from
+        stock picks and stay as-is.
+
+        Kept to email-client-safe CSS (no CSS custom properties,
+        animations, or backdrop-filter, since those aren't reliably
+        supported by mail clients).
 
         Args:
-            analysis_results: dict from AnalysisEngine.
-            sector_data: dict from SectorAnalyzer.
-            breadth: dict from AnalysisEngine.calculate_market_breadth.
+            dashboard_url: optional URL to the full hosted dashboard.
+                Shown as a button under the header and linked in the
+                footer. Omitted entirely when not provided (e.g. local
+                runs with no hosted dashboard).
+            candidates: ranked list from recommender.build_candidate_list()
+                -- {symbol, price, tv_label, tv_class, score, score_coverage}.
+                Empty/omitted renders "No Buy or Strong Buy signals today."
+            track_record: dict from track_record.compute_track_record() --
+                {horizon_days, as_of, tiers, note}. Always shown, even
+                when there isn't enough history yet, rather than hiding a
+                thin sample behind a confident-looking number.
+            bonds: list of dicts from bond_data.fetch_active_government_bonds(),
+                the government bonds that actually traded on the NSE the
+                previous session. Section is omitted entirely when empty
+                (most days won't have this if bond_data's PDF extraction
+                fails -- it fails safe, not required for the email to send).
+            cbk_auctions: list of dicts from
+                cbk_auctions.fetch_open_treasury_auctions(), bonds CBK
+                currently has open for primary-market auction (buy
+                directly from the government via DhowCSD, not the NSE).
+                Rendered as its own section above the NSE bonds table
+                since it's a different market; omitted entirely when
+                empty (no auction open right now, which is most days --
+                each one is only open ~2 weeks).
 
         Returns:
             HTML string suitable for email clients.
         """
         now = datetime.now().strftime('%Y-%m-%d %H:%M EAT')
-        total = len(analysis_results)
+        candidates = candidates or []
+        track_record = track_record or {}
 
-        # Count signals
-        bullish = sum(
-            1 for r in analysis_results.values()
-            if r and r.get('signals', {}).get('overall') == 'bullish'
-        )
-        bearish = sum(
-            1 for r in analysis_results.values()
-            if r and r.get('signals', {}).get('overall') == 'bearish'
-        )
-
-        # Top gainers/losers
-        changes = []
-        for sym, r in analysis_results.items():
-            if r and r.get('daily_change_pct') is not None:
-                changes.append((sym, r['daily_change_pct']))
-        changes.sort(key=lambda x: x[1], reverse=True)
-        top_gainers = changes[:3]
-        top_losers = changes[-3:][::-1] if len(changes) >= 3 else []
+        dashboard_button = ""
+        if dashboard_url:
+            dashboard_button = f"""
+        <a href="{dashboard_url}" style="display:inline-block; margin-top:16px; padding:11px 22px; background-color:#ffffff; color:#0f172a; font-weight:700; font-size:0.85rem; text-decoration:none; border-radius:999px;">
+            📊 View Full Dashboard &rarr;
+        </a>"""
 
         # Build HTML
         html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; color: #1e293b; padding: 20px; }}
-        h1 {{ color: #1e293b; font-size: 1.3rem; }}
-        h2 {{ font-size: 1.1rem; margin-top: 20px; border-bottom: 2px solid #3b82f6; display: inline-block; }}
-        .header {{ background: linear-gradient(135deg, #1e293b, #334155); color: white; padding: 20px; border-radius: 8px; text-align: center; }}
-        .header h1 {{ color: white; }}
-        .stats {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }}
-        .stat {{ background: #f1f5f9; padding: 12px 16px; border-radius: 8px; text-align: center; flex: 1; min-width: 100px; }}
-        .stat .big {{ font-size: 1.5rem; font-weight: 700; color: #3b82f6; }}
-        .stat .label {{ font-size: 0.75rem; color: #64748b; text-transform: uppercase; }}
-        .bullish {{ color: #22c55e; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #f5f7fb;
+            color: #172033;
+            margin: 0;
+            padding: 20px;
+        }}
+        .container {{ max-width: 640px; margin: 0 auto; }}
+        h1 {{ margin: 0 0 6px; font-size: 1.5rem; font-weight: 800; }}
+        h2 {{
+            font-size: 1rem;
+            font-weight: 800;
+            margin: 0 0 14px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #2563eb;
+            display: inline-block;
+        }}
+        .header {{
+            text-align: center;
+            background-color: #0f172a;
+            background-image: linear-gradient(135deg, #0f172a 0%, #115e59 55%, #b45309 100%);
+            color: #ffffff;
+            padding: 30px 20px;
+            border-radius: 18px;
+            margin-bottom: 20px;
+        }}
+        .header h1 {{ color: #ffffff; }}
+        .header .meta {{ color: rgba(255,255,255,0.78); font-size: 0.88rem; margin: 0; }}
+        .card {{
+            background-color: #ffffff;
+            border: 1px solid rgba(148,163,184,0.28);
+            border-radius: 16px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+        }}
+        .bar {{
+            height: 3px;
+            background-color: #2563eb;
+            background-image: linear-gradient(90deg, #2563eb, #0f766e, #f59e0b);
+            border-radius: 3px;
+            margin: -18px -20px 16px;
+        }}
+        .stats {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .stat {{
+            background-color: #f5f7fb;
+            padding: 12px 14px;
+            border-radius: 12px;
+            text-align: center;
+            flex: 1;
+            min-width: 100px;
+            border: 1px solid rgba(148,163,184,0.22);
+        }}
+        .stat .big {{ font-size: 1.4rem; font-weight: 800; color: #2563eb; }}
+        .stat .label {{ font-size: 0.68rem; color: #667085; text-transform: uppercase; font-weight: 700; margin-top: 2px; }}
+        .bullish {{ color: #12b981; }}
         .bearish {{ color: #ef4444; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; margin: 8px 0; }}
-        th, td {{ padding: 8px 10px; text-align: left; border-bottom: 1px solid #e2e8f0; }}
-        th {{ background: #f8fafc; color: #64748b; font-size: 0.75rem; text-transform: uppercase; }}
-        .footer {{ margin-top: 24px; padding-top: 12px; border-top: 1px solid #e2e8f0; font-size: 0.75rem; color: #94a3b8; text-align: center; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
+        th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid rgba(148,163,184,0.28); }}
+        th {{ background-color: #f5f7fb; color: #667085; font-size: 0.68rem; text-transform: uppercase; font-weight: 800; }}
+        td strong {{ color: #0f172a; }}
+        .badge {{ display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; }}
+        .badge.strong_buy {{ background-color: #16a34a; color: #ffffff; }}
+        .badge.buy {{ background-color: #d1fae5; color: #065f46; }}
+        .badge.neutral {{ background-color: #fef3c7; color: #92400e; }}
+        .badge.sell {{ background-color: #fee2e2; color: #991b1b; }}
+        .badge.strong_sell {{ background-color: #dc2626; color: #ffffff; }}
+        .badge.undefined {{ background-color: #f1f5f9; color: #64748b; }}
+        .score {{ display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 0.78rem; font-weight: 800; }}
+        .score-high {{ background-color: #d1fae5; color: #065f46; }}
+        .score-mid {{ background-color: #fef3c7; color: #92400e; }}
+        .score-low {{ background-color: #fee2e2; color: #991b1b; }}
+        .score.partial {{ border: 1.5px dashed currentColor; }}
+        .score-flag {{ font-size: 0.85em; }}
+        .footer {{ text-align: center; padding: 16px 8px 4px; font-size: 0.78rem; color: #667085; }}
+        .footer a {{ color: #2563eb; font-weight: 700; text-decoration: none; }}
     </style>
 </head>
 <body>
+    <div class="container">
     <div class="header">
-        <h1>NSE Daily Market Report</h1>
-        <p>{now}</p>
+        <h1>🎯 What to Buy Today</h1>
+        <p class="meta">{now}</p>{dashboard_button}
     </div>
 
-    <div class="stats">
-        <div class="stat">
-            <div class="big">{total}</div>
-            <div class="label">Stocks</div>
-        </div>
-        <div class="stat">
-            <div class="big bullish">{bullish}</div>
-            <div class="label">Bullish</div>
-        </div>
-        <div class="stat">
-            <div class="big bearish">{bearish}</div>
-            <div class="label">Bearish</div>
-        </div>
-        <div class="stat">
-            <div class="big">{len(sector_data) if sector_data else 0}</div>
-            <div class="label">Sectors</div>
-        </div>
-    </div>
+    <div class="card"><div class="bar"></div>
+    <h2>Today's Buy &amp; Strong Buy Candidates</h2>
 """
-        # Market breadth
-        if breadth:
+        if candidates:
             html += """
-    <h2>Market Breadth</h2>
-    <div class="stats">
-"""
-            for key, label in [
-                ('pct_above_sma50', 'Above SMA50'),
-                ('pct_bullish_macd', 'Bullish MACD'),
-                ('pct_rsi_above_50', 'RSI > 50'),
-            ]:
-                if key in breadth:
-                    html += f"""
-        <div class="stat">
-            <div class="big">{breadth[key]}%</div>
-            <div class="label">{label}</div>
-        </div>"""
-            html += "\n    </div>\n"
-
-        # Top gainers/losers
-        if top_gainers or top_losers:
-            html += """
-    <h2>Top Movers</h2>
     <table>
-        <tr><th>Symbol</th><th>Change</th><th>Direction</th></tr>
+        <tr><th>Symbol</th><th>Signal</th><th>Price</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th></tr>
 """
-            for sym, chg in top_gainers + top_losers:
-                direction = "▲" if chg > 0 else "▼"
-                cls = "bullish" if chg > 0 else "bearish"
+            for c in candidates:
+                price_str = f"{c['price']:.2f}" if c.get('price') is not None else '—'
+                sc = c.get('score')
+                if sc is None:
+                    score_html = '—'
+                else:
+                    sc_cls = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
+                    coverage = c.get('score_coverage')
+                    partial = coverage is not None and coverage < 60
+                    cls = f'score {sc_cls} partial' if partial else f'score {sc_cls}'
+                    flag = ' <span class="score-flag">△</span>' if partial else ''
+                    score_html = f'<span class="{cls}">{sc}{flag}</span>'
                 html += (
-                    f'        <tr><td>{sym}</td>'
-                    f'<td class="{cls}">{chg:+.2f}%</td>'
-                    f'<td class="{cls}">{direction}</td></tr>\n'
+                    f'        <tr><td><strong>{c["symbol"]}</strong></td>'
+                    f'<td><span class="badge {c["tv_class"]}">{c["tv_label"]}</span></td>'
+                    f'<td>{price_str}</td>'
+                    f'<td>{score_html}</td></tr>\n'
                 )
             html += "    </table>\n"
+        else:
+            html += '    <p style="font-size:0.85rem; color:#667085; margin:0;">No Buy or Strong Buy signals today.</p>\n'
 
-        # Sector performance
-        if sector_data:
-            html += """
-    <h2>Sector Performance</h2>
-    <table>
-        <tr><th>Sector</th><th>Stocks</th><th>Avg Change</th><th>Bullish %</th></tr>
-"""
-            for name, data in sector_data.items():
-                cls = "bullish" if data['avg_change_pct'] >= 0 else "bearish"
-                html += (
-                    f'        <tr><td>{name}</td>'
-                    f'<td>{data["count"]}</td>'
-                    f'<td class="{cls}">{data["avg_change_pct"]:+.2f}%</td>'
-                    f'<td>{data["bullish_ratio"]}%</td></tr>\n'
-                )
-            html += "    </table>\n"
+        # Track record — always shown, even when thin, rather than hiding
+        # an unproven or low-sample-size call behind a confident number.
+        tiers = track_record.get('tiers', {})
+        sb, by = tiers.get('strong_buy', {}), tiers.get('buy', {})
+        horizon = track_record.get('horizon_days', 10)
+
+        def _tier_line(label, t):
+            n = t.get('n', 0)
+            if not n:
+                return f"{label}: no scored calls yet"
+            hr = f"{t['hit_rate']:.0f}%" if t.get('hit_rate') is not None else '—'
+            ar = f"{t['avg_return_pct']:+.1f}%" if t.get('avg_return_pct') is not None else '—'
+            return f"{label}: {n} call(s), {hr} hit rate, {ar} avg return"
 
         html += f"""
+    <p style="font-size:0.72rem; color:#98a2b3; margin:12px 0 0;">
+        Track record ({horizon}-trading-day forward return) &mdash;
+        {_tier_line('Strong Buy', sb)}; {_tier_line('Buy', by)}.
+        {track_record.get('note', '')}
+    </p>
+    <p style="font-size:0.78rem; margin:10px 0 0;">
+        Have a budget in mind? Get an exact buy list at
+        <a href="https://portfolio.getkitters.com/recommend">portfolio.getkitters.com</a>.
+    </p>
+    </div>
+"""
+
+        # Bonds CBK currently has open for primary-market auction (buy directly
+        # from the government via DhowCSD -- a different market from the NSE
+        # secondary-market table below, so kept as its own section).
+        if cbk_auctions:
+            closes_at = cbk_auctions[0].get('sale_closes', '')
+            html += f"""
+    <div class="card"><div class="bar"></div>
+    <h2>&#127881; Currently Open for Auction &mdash; CBK Primary Market</h2>
+    <p style="font-size:0.78rem; color:#667085; margin:0 0 12px;">
+        Buy these directly from the government via
+        <a href="https://dhowcsd.centralbank.go.ke/">DhowCSD</a> &mdash; not through a
+        stockbroker. This auction closes <strong>{closes_at}</strong>.
+    </p>
+    <table>
+        <tr><th>Bond</th><th>Coupon</th><th>Maturity</th>
+        <th title="Paid semi-annually. Scaled to CBK's KES 50,000 minimum subscription">Coupon Payment (per KES 50,000)</th>
+        <th>Sale Closes</th></tr>
+"""
+            for b in cbk_auctions:
+                coupon = f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—'
+                cpn_pmt = (f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                           if b.get('coupon_payment_per_50k') is not None else '—')
+                html += (
+                    f'        <tr><td><strong>{b["issue_no"]}</strong></td><td>{coupon}</td>'
+                    f'<td>{b.get("maturity_date", "—")}</td><td>{cpn_pmt}</td>'
+                    f'<td>{b.get("sale_closes", "—")}</td></tr>\n'
+                )
+            html += "    </table>\n"
+            html += (
+                '    <p style="font-size:0.7rem; color:#98a2b3; margin:8px 0 0;">'
+                "Scraped from CBK's Treasury Bonds prospectus PDF &mdash; verify on "
+                '<a href="https://www.centralbank.go.ke/bills-bonds/treasury-bonds/">CBK\'s site</a> '
+                'or the DhowCSD portal before bidding. Switch auctions (exchanging a bond you '
+                'already hold) are not shown here.</p>\n'
+            )
+            html += "    </div>\n"
+
+        # Government bonds actively traded on the NSE (Treasury + Infrastructure)
+        if bonds:
+            html += """
+    <div class="card"><div class="bar"></div>
+    <h2>&#127974; Government Bonds &mdash; Actively Traded on NSE (Secondary Market)</h2>
+    <p style="font-size:0.78rem; color:#667085; margin:0 0 12px;">
+        Machine-extracted from the NSE's daily bond prices PDF &mdash; treat as
+        approximate and verify before acting on any figure. Sorted by issue
+        date (most recently issued first), then by yield.
+    </p>
+"""
+            from bond_data import bond_market_verdict, recommend_bonds
+            verdict = bond_market_verdict(bonds)
+            if verdict:
+                badge_class = {'buy': 'buy', 'hold': 'neutral', 'avoid': 'sell'}[verdict['verdict']]
+                html += (
+                    '    <p style="font-size:0.85rem; margin:0 0 14px;">'
+                    f'<span class="badge {badge_class}">{verdict["label"]}</span> '
+                    f'<span style="color:#344054;">{verdict["reason"]}</span></p>\n'
+                )
+            picks = recommend_bonds(bonds)
+            if picks:
+                html += """
+    <div style="background:#d1fae5; border-radius:8px; padding:12px 16px; margin:0 0 16px;">
+        <div style="font-weight:700; font-size:0.85rem; color:#065f46; margin-bottom:6px;">
+            &#127942; Highest yield by time horizon
+        </div>
+"""
+                for p in picks:
+                    b = p['bond']
+                    html += (
+                        f'        <div style="font-size:0.8rem; color:#065f46; margin:2px 0;">'
+                        f'<strong>{p["label"]}:</strong> {b["issue_no"]} &mdash; '
+                        f'{b["yield_pct"]:.2f}% yield (matures {b["maturity_year"]})</div>\n'
+                    )
+                html += """
+        <div style="font-size:0.72rem; color:#065f46; margin-top:8px; opacity:0.85;">
+            Same issuer (Government of Kenya) in every bucket, so within a time
+            horizon the higher-yielding bond is the straightforward pick. This is
+            not a single "best bond overall" &mdash; that depends on when you
+            actually need the money back.
+        </div>
+    </div>
+"""
+            html += """
+    <table>
+        <tr><th>Bond</th><th>Maturity</th><th>Yield</th><th>Coupon</th>
+        <th title="Paid semi-annually. Scaled to CBK's KES 50,000 minimum subscription">Coupon Payment (per KES 50,000)</th>
+        <th>Clean Price</th><th>Value Traded (KES)</th></tr>
+"""
+            for b in bonds:
+                maturity = str(b['maturity_year']) if b.get('maturity_year') is not None else '—'
+                coupon = f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—'
+                cpn_pmt = (f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                           if b.get('coupon_payment_per_50k') is not None else '—')
+                yld = f"{b['yield_pct']:.2f}%" if b.get('yield_pct') is not None else '—'
+                clean = f"{b['clean_price']:.2f}" if b.get('clean_price') is not None else '—'
+                traded = f"{b['value_traded']:,.0f}" if b.get('value_traded') is not None else '—'
+                html += (
+                    f'        <tr><td><strong>{b["issue_no"]}</strong></td>'
+                    f'<td>{maturity}</td><td>{yld}</td><td>{coupon}</td><td>{cpn_pmt}</td>'
+                    f'<td>{clean}</td><td>{traded}</td></tr>\n'
+                )
+            html += "    </table>\n"
+            html += (
+                '    <p style="font-size:0.7rem; color:#98a2b3; margin:8px 0 0;">'
+                "Coupon Payment assumes CBK's KES 50,000 minimum subscription (Treasury/"
+                'Infrastructure bonds are bought in multiples of KES 50,000), paid twice a year '
+                '(semi-annually) &mdash; none of these series pay quarterly. Scale up for a larger '
+                'holding, e.g. double it for KES 100,000 invested.</p>\n'
+            )
+            html += "    </div>\n"
+
+        footer_link = (
+            f'<a href="{dashboard_url}">View the full dashboard &rarr;</a><br>'
+            if dashboard_url else ''
+        )
+        html += f"""
     <div class="footer">
-        Generated by Kenyan Stock Analyzer — {now}<br>
-        For full reports, check the reports directory.
+        {footer_link}
+        Generated by Kenyan Stock Analyzer &mdash; {now}
+    </div>
     </div>
 </body>
 </html>"""

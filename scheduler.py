@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 
 
 def run_analysis(period='6mo', interval='1d', report_type='html',
-                 force_refresh=False, export_excel=False):
+                 force_refresh=False, export_excel=False, market_hours_only=False):
     """
     Run the full analysis pipeline by calling main.py.
 
@@ -40,10 +40,15 @@ def run_analysis(period='6mo', interval='1d', report_type='html',
         report_type: 'html', 'pdf', or 'both'.
         force_refresh: Bypass cache.
         export_excel: Also export Excel workbook.
+        market_hours_only: Skip the run if the NSE is not currently open.
 
     Returns:
-        bool: True if successful.
+        bool: True if successful (or skipped because the market is closed).
     """
+    if market_hours_only and not is_market_open():
+        logger.info("Market is closed — skipping run (--market-hours-only).")
+        return True
+
     main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'main.py')
     cmd = [
         sys.executable, main_py,
@@ -110,6 +115,7 @@ def main():
             report_type=args.report_type,
             force_refresh=args.force_refresh,
             export_excel=args.export_excel,
+            market_hours_only=args.market_hours_only,
         )
         sys.exit(0 if success else 1)
 
@@ -129,27 +135,27 @@ def main():
     schedule.every().monday.at(config.market_close).do(
         run_analysis, period=args.period, interval=args.interval,
         report_type=args.report_type, force_refresh=args.force_refresh,
-        export_excel=args.export_excel
+        export_excel=args.export_excel, market_hours_only=args.market_hours_only
     )
     schedule.every().tuesday.at(config.market_close).do(
         run_analysis, period=args.period, interval=args.interval,
         report_type=args.report_type, force_refresh=args.force_refresh,
-        export_excel=args.export_excel
+        export_excel=args.export_excel, market_hours_only=args.market_hours_only
     )
     schedule.every().wednesday.at(config.market_close).do(
         run_analysis, period=args.period, interval=args.interval,
         report_type=args.report_type, force_refresh=args.force_refresh,
-        export_excel=args.export_excel
+        export_excel=args.export_excel, market_hours_only=args.market_hours_only
     )
     schedule.every().thursday.at(config.market_close).do(
         run_analysis, period=args.period, interval=args.interval,
         report_type=args.report_type, force_refresh=args.force_refresh,
-        export_excel=args.export_excel
+        export_excel=args.export_excel, market_hours_only=args.market_hours_only
     )
     schedule.every().friday.at(config.market_close).do(
         run_analysis, period=args.period, interval=args.interval,
         report_type=args.report_type, force_refresh=args.force_refresh,
-        export_excel=args.export_excel
+        export_excel=args.export_excel, market_hours_only=args.market_hours_only
     )
 
     logger.info("Scheduler started. Press Ctrl+C to stop.")

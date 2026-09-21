@@ -146,14 +146,24 @@ def main():
     except Exception as e:
         logger.warning(f"Earnings ICS export skipped: {e}")
 
+    # ---- Actively-traded government bonds (NSE bond prices PDF) ----
+    bonds = []
+    try:
+        from bond_data import fetch_active_government_bonds
+        bonds = fetch_active_government_bonds()
+    except Exception as e:
+        logger.warning(f"Bond data skipped: {e}")
+
     # ---- Context, scoring, alerts ----
     usd_kes = None
+    sector_medians = {}
     try:
-        from market_context import fetch_usd_kes
+        from market_context import compute_sector_medians, fetch_usd_kes
+        sector_medians = compute_sector_medians(fundamentals_data)
         if config.enable_fx:
             usd_kes = fetch_usd_kes()
     except Exception as e:
-        logger.warning(f"FX skipped: {e}")
+        logger.warning(f"Market context skipped: {e}")
 
     scores, alerts = {}, {}
     try:
@@ -161,7 +171,7 @@ def main():
         for sym, r in analysis_results.items():
             if r:
                 f = fundamentals_data.get(sym, {})
-                scores[sym] = score_stock(sym, r, f)
+                scores[sym] = score_stock(sym, r, f, sector_medians=sector_medians)
                 a = generate_alerts(sym, r, f, validations.get(sym))
                 if a:
                     alerts[sym] = a
@@ -191,8 +201,19 @@ def main():
         return
 
     from email_notifier import EmailNotifier
+    from recommender import build_candidate_list
     notifier = EmailNotifier(config)
-    body = notifier.generate_email_body(analysis_results, sector_data, breadth)
+    candidates = build_candidate_list(analysis_results, fundamentals_data, scores)
+    # No persisted S3 signal history from this standalone script (that's the
+    # deployed Lambda's job -- see aws/lambda_handler.py), so there's
+    # honestly nothing to show here yet.
+    track_record = {
+        "horizon_days": 10, "as_of": None, "tiers": {},
+        "note": "Track record isn't available from this script -- see the deployed dashboard.",
+    }
+    body = notifier.generate_email_body(
+        candidates=candidates, track_record=track_record, bonds=bonds,
+    )
     attachments = [pdf_path] if pdf_path else []
     if ics_path and os.path.exists(ics_path):
         attachments.append(ics_path)

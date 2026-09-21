@@ -16,6 +16,7 @@ import base64
 import io
 import json
 from datetime import datetime
+from html import escape as _esc
 import logging
 
 # Fix WeasyPrint on macOS
@@ -35,7 +36,7 @@ import matplotlib.ticker as mticker
 import seaborn as sns
 import numpy as np
 import pandas as pd
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 from fundamental_analysis import FundamentalAnalysis
 
 logger = logging.getLogger(__name__)
@@ -109,7 +110,10 @@ class ReportGenerator:
         if clean_old:
             self._clean_old_reports()
 
-        self.env = Environment(loader=FileSystemLoader(self.template_dir))
+        self.env = Environment(
+            loader=FileSystemLoader(self.template_dir),
+            autoescape=select_autoescape(['html']),
+        )
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         logger.info(
@@ -327,9 +331,7 @@ class ReportGenerator:
         resistances = analysis_result.get('resistance', [])
         daily_change = analysis_result.get('daily_change_pct')
 
-        # Default fundamentals if none provided
-        if fundamentals is None:
-            fundamentals = {}
+        # Default similar/peer lists if none provided
         if similar_stocks is None:
             similar_stocks = []
         if sector_peers is None:
@@ -910,7 +912,7 @@ h1 {{ font-size: 18px; margin: 0; }}
 h2 {{ font-size: 12px; border-bottom: 2px solid #3b82f6; padding-bottom: 3px; margin: 14px 0 6px; }}
 .sub {{ color: #64748b; font-size: 10px; margin-bottom: 10px; }}
 .pills {{ margin: 8px 0; }}
-.pill {{ display: inline-block; background: #f1f5f9; border-radius: 8px; padding: 6px 12px; margin-right: 6px; }}
+.pill {{ display: inline-block; background: #f1f5f9; border-radius: 999px; padding: 6px 12px; margin-right: 6px; }}
 .pill b {{ font-size: 15px; }}
 .g {{ color: #16a34a; }} .r {{ color: #dc2626; }} .a {{ color: #d97706; }}
 table {{ width: 100%; border-collapse: collapse; font-size: 10px; }}
@@ -947,7 +949,9 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
 
     def generate_index(self, analysis_results, sector_data=None, breadth=None,
                        report_files=None, fundamentals_data=None,
-                       validations=None, scores=None, alerts=None, usd_kes=None):
+                       validations=None, scores=None, alerts=None, usd_kes=None,
+                       bonds=None, cbk_auctions=None, track_record_legacy=None,
+                       track_record_new=None):
         """
         Generate the main index.html dashboard — the single entry point.
 
@@ -1018,8 +1022,12 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
                 'dividend_type': fund.get('dividend_type'),
                 # Next earnings date (used by the Next Earnings page)
                 'earnings_next_date': fund.get('earnings_next_date'),
-                # Transparent factor score (0-100)
+                # Transparent factor score (0-100), plus how much of the
+                # factor weight actually had data behind it -- see score_td.
                 'score': (scores or {}).get(symbol, {}).get('overall'),
+                'score_coverage': (scores or {}).get(symbol, {}).get('coverage'),
+                'score_factors': (scores or {}).get(symbol, {}).get('factors_present'),
+                'score_factors_total': (scores or {}).get(symbol, {}).get('factors_total'),
                 # Price validation (independent cross-check + freshness)
                 'validation': (validations or {}).get(symbol, {}),
             }
@@ -1057,7 +1065,9 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
             stocks=stocks, gainers=gainers, losers=losers, sectors=sector_data,
             breadth=breadth, sector_chart=sector_chart, bullish=bullish,
             bearish=bearish, neutral=neutral, total=len(stocks),
-            data_date=data_date, alerts=alerts, usd_kes=usd_kes,
+            data_date=data_date, alerts=alerts, usd_kes=usd_kes, bonds=bonds,
+            cbk_auctions=cbk_auctions, track_record_legacy=track_record_legacy,
+            track_record_new=track_record_new,
         )
         return index_path
 
@@ -1067,111 +1077,453 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
         ('technicals.html', '📈 Technicals'),
         ('fundamentals.html', '💰 Fundamentals'),
         ('dividends.html', '💵 Dividends'),
+        ('bonds.html', '🏛️ Bonds'),
         ('earnings.html', '📅 Next Earnings'),
         ('sectors.html', '📊 Sectors'),
         ('foreign.html', '🌍 Foreign Flows'),
         ('pulse.html', '🧭 Market Pulse'),
         ('quality.html', '✅ Data Quality'),
+        ('track_record.html', '🎯 Track Record'),
     ]
 
     def _dashboard_css(self):
         """Shared stylesheet for all dashboard pages (plain string)."""
         return """<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; color: #1e293b; }
-.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-.header { background: linear-gradient(135deg, #0f172a, #1e293b); color: white; padding: 26px; border-radius: 12px; margin-bottom: 16px; text-align: center; }
-.header h1 { font-size: 1.8rem; margin-bottom: 5px; }
-.header .date { color: #94a3b8; font-size: 0.85rem; }
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #f5f7fb;
+  --surface: rgba(255,255,255,0.88);
+  --surface-solid: #ffffff;
+  --text: #172033;
+  --muted: #667085;
+  --border: rgba(148, 163, 184, 0.28);
+  --border-strong: rgba(51, 65, 85, 0.16);
+  --blue: #2563eb;
+  --green: #12b981;
+  --green-dark: #047857;
+  --red: #ef4444;
+  --red-dark: #b91c1c;
+  --amber: #f59e0b;
+  --amber-dark: #b45309;
+  --violet: #7c3aed;
+  --shadow-sm: 0 8px 24px rgba(15, 23, 42, 0.07);
+  --shadow-md: 0 18px 50px rgba(15, 23, 42, 0.12);
+  --radius: 24px;
+}
+html { scroll-behavior: smooth; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background:
+    linear-gradient(135deg, rgba(37, 99, 235, 0.08), transparent 34%),
+    linear-gradient(225deg, rgba(18, 185, 129, 0.12), transparent 42%),
+    linear-gradient(180deg, #fbfcff 0%, var(--bg) 50%, #fff7ed 100%);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.55;
+  overflow-x: hidden;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  opacity: 0.36;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(15, 23, 42, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 23, 42, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+  animation: grid-drift 24s linear infinite;
+}
+a { color: var(--blue); }
+code {
+  background: #eef2f7;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1px 5px;
+  color: #334155;
+}
+.container { max-width: 1440px; margin: 0 auto; padding: 24px; }
+.header {
+  background:
+    linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(17, 94, 89, 0.92) 55%, rgba(180, 83, 9, 0.82)),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.14), transparent);
+  color: white;
+  padding: 32px 26px;
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  text-align: center;
+  border: 1px solid rgba(255,255,255,0.18);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+  position: relative;
+  isolation: isolate;
+  animation: panel-rise 650ms ease both;
+}
+.header::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.16) 35%, transparent 58%);
+  transform: translateX(-120%);
+  animation: header-sheen 6s ease-in-out infinite;
+}
+.header h1 {
+  font-size: clamp(1.85rem, 3vw, 2.75rem);
+  line-height: 1.08;
+  margin-bottom: 8px;
+  font-weight: 900;
+  letter-spacing: 0;
+}
+.header .date { color: rgba(255,255,255,0.78); font-size: 0.88rem; }
 /* Nav */
-.nav { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
-.nav-item { padding: 10px 16px; border-radius: 8px; background: white; color: #334155; text-decoration: none; font-weight: 600; font-size: 0.9rem; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 2px solid transparent; }
-.nav-item:hover { border-color: #93c5fd; }
-.nav-item.active { background: #1e293b; color: #fff; }
-.page-intro { color: #64748b; font-size: 0.9rem; margin-bottom: 16px; }
+.nav {
+  position: sticky;
+  top: 12px;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin-bottom: 20px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  animation: panel-rise 620ms ease both;
+}
+.nav-item {
+  padding: 8px 11px;
+  border-radius: var(--radius);
+  background: #ffffff;
+  color: #334155;
+  text-decoration: none;
+  font-weight: 750;
+  font-size: 0.84rem;
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.045);
+  transition: transform 160ms ease, color 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+.nav-item:hover {
+  transform: translateY(-1px);
+  border-color: rgba(37, 99, 235, 0.34);
+  color: #0f172a;
+  background: #f8fafc;
+}
+.nav-item.active {
+  background: linear-gradient(135deg, #0f172a, #0f766e);
+  color: #ffffff;
+  border-color: rgba(255,255,255,0.16);
+  box-shadow: 0 12px 26px rgba(15, 23, 42, 0.16);
+}
+.page-intro {
+  color: var(--muted);
+  font-size: 0.92rem;
+  margin-bottom: 16px;
+  max-width: 92ch;
+}
 /* Stats */
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 20px; }
-.stat-card { background: white; padding: 16px; border-radius: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-.stat-card .stat-value { font-size: 1.8rem; font-weight: 700; }
-.stat-card .stat-label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; margin-top: 4px; }
-.stat-card .bullish { color: #22c55e; } .stat-card .bearish { color: #ef4444; } .stat-card .neutral { color: #f59e0b; }
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.stat-card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.95), rgba(248,250,252,0.92));
+  padding: 16px;
+  border-radius: var(--radius);
+  text-align: center;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  min-height: 94px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  transition: transform 170ms ease, box-shadow 170ms ease, border-color 170ms ease;
+}
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--border-strong);
+}
+.stat-card .stat-value {
+  font-size: clamp(1.45rem, 2.4vw, 2rem);
+  font-weight: 900;
+  line-height: 1.05;
+  overflow-wrap: anywhere;
+}
+.stat-card .stat-label {
+  font-size: 0.73rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0;
+  margin-top: 6px;
+  font-weight: 750;
+}
+.stat-card .bullish { color: var(--green-dark); }
+.stat-card .bearish { color: var(--red-dark); }
+.stat-card .neutral { color: var(--amber-dark); }
 /* Section */
-.section { background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-.section h2 { font-size: 1.1rem; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 2px solid #3b82f6; display: inline-block; }
+.section {
+  background: var(--surface);
+  backdrop-filter: blur(18px);
+  border-radius: var(--radius);
+  padding: 22px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  overflow: hidden;
+  animation: panel-rise 600ms ease both;
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+.section::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  background: linear-gradient(90deg, var(--blue), var(--green), var(--amber));
+  opacity: 0.78;
+}
+.section:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--border-strong);
+}
+.section h2 {
+  font-size: clamp(1.05rem, 1.45vw, 1.28rem);
+  line-height: 1.25;
+  margin-bottom: 16px;
+  color: #0f172a;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.section h2::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  min-width: 32px;
+  background: linear-gradient(90deg, rgba(37, 99, 235, 0.36), transparent);
+}
 /* Table */
-.table-wrap { overflow-x: auto; }
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(255,255,255,0.74);
+}
 table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }
-th { background: #f8fafc; color: #64748b; font-size: 0.7rem; text-transform: uppercase; font-weight: 600; position: sticky; top: 0; }
-tr:hover { background: #f8fafc; }
-.stock-link { color: #3b82f6; text-decoration: none; font-weight: 600; }
+th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th {
+  background: linear-gradient(180deg, #f8fafc, #eef2f7);
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  font-weight: 800;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+tbody tr { transition: background 140ms ease; }
+tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
+.stock-link { color: var(--blue); text-decoration: none; font-weight: 800; }
 .stock-link:hover { text-decoration: underline; }
 /* Badges */
-.badge { padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: 600; text-transform: capitalize; }
-.bullish, .golden_cross, .bullish_cross, .oversold, .buy { background: #dcfce7; color: #166534; }
-.bearish, .death_cross, .bearish_cross, .overbought, .sell { background: #fee2e2; color: #991b1b; }
-.neutral, .within_bands, .normal { background: #fef3c7; color: #92400e; }
-.strong_buy { background: #16a34a; color: #fff; }
-.strong_sell { background: #dc2626; color: #fff; }
-.undefined { background: #f1f5f9; color: #64748b; }
-.high_volume { background: #ede9fe; color: #5b21b6; }
-.low_volume { background: #f1f5f9; color: #64748b; }
+.badge {
+  display: inline-block;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1.1;
+  font-weight: 800;
+  text-transform: capitalize;
+  box-shadow: 0 7px 16px rgba(15, 23, 42, 0.07);
+}
+.badge.bullish, .badge.golden_cross, .badge.bullish_cross, .badge.oversold, .badge.buy { background: #d1fae5; color: #065f46; }
+.badge.bearish, .badge.death_cross, .badge.bearish_cross, .badge.overbought, .badge.sell { background: #fee2e2; color: #991b1b; }
+.badge.neutral, .badge.within_bands, .badge.normal { background: #fef3c7; color: #92400e; }
+.badge.strong_buy { background: linear-gradient(135deg, var(--green), var(--green-dark)); color: #fff; }
+.badge.strong_sell { background: linear-gradient(135deg, var(--red), var(--red-dark)); color: #fff; }
+.badge.undefined { background: #f1f5f9; color: #64748b; }
+.badge.high_volume { background: #ede9fe; color: #5b21b6; }
+.badge.low_volume { background: #f1f5f9; color: #64748b; }
 /* Score chips */
-.score { display: inline-block; min-width: 30px; padding: 2px 8px; border-radius: 10px; font-weight: 700; font-size: 0.75rem; text-align: center; }
-.score-high { background: #dcfce7; color: #166534; }
+.score {
+  display: inline-block;
+  min-width: 32px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 0.76rem;
+  text-align: center;
+}
+.score-high { background: #d1fae5; color: #065f46; }
 .score-mid { background: #fef3c7; color: #92400e; }
 .score-low { background: #fee2e2; color: #991b1b; }
-.pv-mark { font-size: 0.75rem; cursor: help; }
+.score.partial { border: 1.5px dashed currentColor; cursor: help; }
+.score-flag { font-size: 0.85em; vertical-align: text-top; }
+.pv-mark { font-size: 0.78rem; cursor: help; margin-left: 2px; }
 /* Dividend */
-.div-pay { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #ccfbf1; color: #0f766e; font-weight: 700; }
-.div-unverified { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #fef3c7; color: #92400e; font-weight: 700; cursor: help; }
-.div-zero { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #f1f5f9; color: #94a3b8; font-weight: 600; }
-.exdate-upcoming { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #16a34a; color: #fff; font-weight: 700; }
-.exdate-past { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #e0e7ff; color: #3730a3; font-weight: 600; }
+.div-pay, .div-unverified, .div-zero, .exdate-upcoming, .exdate-past, .cal-chip,
+.bc-future, .bc-soon, .bc-passed {
+  display: inline-block;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-weight: 800;
+  font-size: 0.78rem;
+  line-height: 1.1;
+}
+.div-pay { background: #ccfbf1; color: #0f766e; }
+.div-unverified { background: #fef3c7; color: #92400e; cursor: help; }
+.div-zero { background: #f1f5f9; color: #94a3b8; }
+.exdate-upcoming, .cal-near { background: linear-gradient(135deg, var(--green), var(--green-dark)); color: #fff; }
+.exdate-past, .cal-passed { background: #fee2e2; color: #991b1b; }
 .exdate-none { color: #cbd5e1; }
-.cal-chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-weight: 700; font-size: 0.78rem; }
-.cal-near { background: #16a34a; color: #fff; }
 .cal-far { background: #fde68a; color: #92400e; }
-.cal-passed { background: #fecaca; color: #991b1b; }
 /* Book-closure / ex-date urgency: green=future, amber=within a week, red=passed */
-.bc-future { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #16a34a; color: #fff; font-weight: 700; }
-.bc-soon { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #f59e0b; color: #fff; font-weight: 700; }
-.bc-passed { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #dc2626; color: #fff; font-weight: 700; }
-.cal-legend { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
-.cal-h3 { font-size: 0.95rem; margin-bottom: 10px; }
-.cal-count { color: #94a3b8; font-weight: 400; }
+.bc-future { background: linear-gradient(135deg, var(--green), var(--green-dark)); color: #fff; }
+.bc-soon { background: linear-gradient(135deg, var(--amber), var(--amber-dark)); color: #fff; }
+.bc-passed { background: linear-gradient(135deg, var(--red), var(--red-dark)); color: #fff; }
+.cal-legend { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; color: var(--muted); font-size: 0.84rem; }
+.cal-h3 { font-size: 0.96rem; margin-bottom: 10px; color: #0f172a; }
+.cal-count { color: #94a3b8; font-weight: 500; }
 /* Alerts */
-.alerts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
-.alert-card { background: #f8fafc; border: 1px solid #e2e8f0; border-left: 3px solid #3b82f6; border-radius: 8px; padding: 10px 12px; }
-.alert-card .sym { font-weight: 700; color: #3b82f6; margin-bottom: 4px; }
-.alert-card .items { font-size: 0.8rem; color: #475569; line-height: 1.5; }
-.dq-note { font-size: 0.8rem; color: #64748b; margin-top: 8px; }
+.alerts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.alert-card {
+  background: linear-gradient(180deg, #ffffff, #f8fafc);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.76);
+  transition: transform 170ms ease, border-color 170ms ease, box-shadow 170ms ease;
+}
+.alert-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(37, 99, 235, 0.28);
+  box-shadow: var(--shadow-sm);
+}
+.alert-card .sym { font-weight: 850; color: var(--blue); margin-bottom: 4px; }
+.alert-card .items { font-size: 0.82rem; color: #475569; line-height: 1.55; }
+.dq-note { font-size: 0.82rem; color: var(--muted); margin-top: 10px; line-height: 1.55; }
 .dq-mismatch { color: #991b1b; }
 .mcap-cell { font-size: 0.8rem; color: #475569; }
-.positive { color: #22c55e; font-weight: 600; }
-.negative { color: #ef4444; font-weight: 600; }
+.positive { color: var(--green-dark); font-weight: 800; }
+.negative { color: var(--red-dark); font-weight: 800; }
+.neutral { color: var(--amber-dark); font-weight: 800; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-.grid-3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
-.sector-card { background: #f8fafc; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; }
-.sector-card h3 { font-size: 0.9rem; margin-bottom: 4px; }
-.sector-change { font-size: 1.3rem; font-weight: 700; }
-.sector-detail { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
-.chart-img { max-width: 100%; border-radius: 8px; margin-top: 12px; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+.sector-card {
+  background: linear-gradient(180deg, #ffffff, #f8fafc);
+  padding: 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.76);
+  transition: transform 170ms ease, box-shadow 170ms ease, border-color 170ms ease;
+}
+.sector-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-sm);
+  border-color: rgba(15, 118, 110, 0.28);
+}
+.sector-card h3 { font-size: 0.92rem; margin-bottom: 6px; color: #0f172a; }
+.sector-change { font-size: 1.42rem; line-height: 1.1; font-weight: 900; }
+.sector-detail { font-size: 0.76rem; color: var(--muted); margin-top: 6px; }
+.chart-img {
+  display: block;
+  max-width: 100%;
+  border-radius: var(--radius);
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  background: #ffffff;
+  box-shadow: var(--shadow-sm);
+}
 .filter-bar { margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
-.filter-bar input { padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.9rem; width: 220px; }
-.footer { text-align: center; padding: 20px; color: #94a3b8; font-size: 0.8rem; }
+.filter-bar input {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+  width: min(100%, 260px);
+  background: #ffffff;
+  color: var(--text);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.filter-bar input:focus {
+  outline: none;
+  border-color: rgba(37, 99, 235, 0.48);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+.footer { text-align: center; padding: 22px 16px 4px; color: #94a3b8; font-size: 0.8rem; }
 /* Plain-English explainer cards */
-.explain-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; margin-top: 6px; }
-.explain-card { background: #f8fafc; border: 1px solid #e2e8f0; border-left: 4px solid #3b82f6; border-radius: 8px; padding: 14px 16px; }
-.explain-card h4 { font-size: 0.95rem; margin-bottom: 6px; color: #1e293b; }
-.explain-card p { font-size: 0.84rem; color: #475569; line-height: 1.5; margin: 5px 0; }
+.explain-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin-top: 6px; }
+.explain-card {
+  background: linear-gradient(180deg, #ffffff, #f8fafc);
+  border: 1px solid var(--border);
+  border-left: 3px solid #0f766e;
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  transition: transform 170ms ease, border-color 170ms ease, box-shadow 170ms ease;
+}
+.explain-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(15, 118, 110, 0.28);
+  box-shadow: var(--shadow-sm);
+}
+.explain-card h4 { font-size: 0.96rem; margin-bottom: 6px; color: #0f172a; }
+.explain-card p { font-size: 0.84rem; color: #475569; line-height: 1.55; margin: 5px 0; }
 .explain-card .eg { color: #0f766e; }
 .explain-card .good { color: #166534; }
 /* Fundamental cell verdicts: green = good, red = bad */
-.fgood { color: #16a34a; font-weight: 700; }
-.fmid { color: #d97706; font-weight: 700; }
-.fbad { color: #dc2626; font-weight: 700; }
-@media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
+.fgood { color: #047857; font-weight: 850; }
+.fmid { color: #b45309; font-weight: 850; }
+.fbad { color: #b91c1c; font-weight: 850; }
+@keyframes panel-rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes header-sheen {
+  0%, 42% { transform: translateX(-120%); }
+  72%, 100% { transform: translateX(120%); }
+}
+@keyframes grid-drift {
+  from { background-position: 0 0, 0 0; }
+  to { background-position: 44px 44px, 44px 44px; }
+}
+@media (max-width: 768px) {
+  .container { padding: 14px; }
+  .header { padding: 26px 18px; }
+  .nav { position: static; }
+  .grid-2 { grid-template-columns: 1fr; }
+  .section { padding: 18px 14px; }
+  th, td { padding: 9px 10px; }
+}
+@media (max-width: 520px) {
+  .header h1 { font-size: 1.7rem; }
+  .header .date { font-size: 0.82rem; }
+  .nav-item { font-size: 0.8rem; padding: 8px 10px; }
+  .page-intro { font-size: 0.9rem; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat-card { min-height: 88px; padding: 14px 10px; }
+  table { font-size: 0.78rem; }
+  th, td { padding: 8px 7px; }
+  .badge, .score { font-size: 0.68rem; padding: 3px 7px; }
+  .filter-bar input { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 </style>"""
 
     def _make_foreign_flow_trend_chart(self, weeks):
@@ -1353,6 +1705,216 @@ tr:hover { background: #f8fafc; }
                 'with an example and what counts as a good value.</p>'
                 f'<div class="explain-grid">{items}</div></div>')
 
+    def _build_cbk_auctions_html(self, cbk_auctions):
+        """
+        'Currently Open for Auction' section — bonds CBK is selling right
+        now via DhowCSD (primary market: brand-new bonds, bought directly
+        from the government). Kept separate from the NSE table below
+        (secondary market: bonds already issued, trading between
+        investors via a stockbroker) since they're different markets
+        answering different questions.
+        """
+        def _fmt_date(iso):
+            if not iso:
+                return '—'
+            try:
+                return datetime.strptime(iso, '%Y-%m-%d').strftime('%d %b %Y')
+            except ValueError:
+                return iso
+
+        if not cbk_auctions:
+            return (
+                '<div class="section"><h2>🆕 Currently Open for Auction — CBK Primary Market</h2>'
+                '<div class="dq-note">No CBK Treasury/Infrastructure bond auction is open right '
+                'now. CBK auctions new bonds roughly monthly, each open for about two weeks — '
+                'check back, or see <a href="https://www.centralbank.go.ke/bills-bonds/treasury-bonds/" '
+                'target="_blank">CBK\'s Treasury Bonds page</a> directly.</div></div>'
+            )
+
+        rows = ''.join(
+            '<tr><td><strong>{issue_no}</strong></td><td>{coupon}</td><td>{maturity}</td>'
+            '<td>{cpn_pmt}</td><td>{closes}</td></tr>'.format(
+                issue_no=b['issue_no'],
+                coupon=f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—',
+                maturity=_fmt_date(b.get('maturity_date')),
+                cpn_pmt=(f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                         if b.get('coupon_payment_per_50k') is not None else '—'),
+                closes=_fmt_date(b.get('sale_closes')),
+            )
+            for b in cbk_auctions
+        )
+        closes_at = _fmt_date(cbk_auctions[0].get('sale_closes'))
+        return (
+            '<div class="section"><h2>🆕 Currently Open for Auction — CBK Primary Market</h2>'
+            '<p style="font-size:0.85rem; color:#475569; margin:0 0 12px;">Buy these directly '
+            'from the government via <a href="https://dhowcsd.centralbank.go.ke/" target="_blank" '
+            f'style="color:#3b82f6; font-weight:600;">DhowCSD</a> — not through a stockbroker. '
+            f'This auction closes <strong>{closes_at}</strong>.</p>'
+            '<div class="table-wrap"><table><thead><tr>'
+            '<th>Bond</th><th>Coupon</th><th>Maturity</th>'
+            '<th title="Paid semi-annually. Scaled to CBK\'s KES 50,000 minimum subscription">'
+            'Coupon Payment (per KES 50,000)</th><th>Sale Closes</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table></div>'
+            '<div class="dq-note">Scraped from CBK\'s Treasury Bonds prospectus PDF — verify on '
+            '<a href="https://www.centralbank.go.ke/bills-bonds/treasury-bonds/" target="_blank">'
+            "CBK's site</a> or the DhowCSD portal before bidding. Switch auctions (exchanging a "
+            'bond you already hold) are not shown here — only regular cash-sale auctions open to '
+            'new investors.</div></div>'
+        )
+
+    def _build_bonds_body(self, bonds, cbk_auctions=None):
+        """
+        Build the Government Bonds page:
+          1. Currently Open for Auction — CBK primary market.
+          2. Actively Traded on NSE — secondary market, from
+             bond_data.fetch_active_government_bonds(), sorted
+             most-recently-issued first (verdict + per-horizon picks +
+             table, mirroring the daily email's bonds section).
+        Plus a plain-English glossary at the bottom.
+        """
+        cbk_html = self._build_cbk_auctions_html(cbk_auctions)
+        page_intro = (
+            '<p class="page-intro">Government bonds (Treasury + Infrastructure) — what CBK '
+            "currently has open for auction, and what's actively trading on the NSE.</p>"
+        )
+
+        if not bonds:
+            nse_html = (
+                '<div class="section"><h2>📋 Actively Traded on NSE (Secondary Market)</h2>'
+                '<div class="dq-note dq-mismatch">⚠️ No bond data available for this run '
+                '(the NSE bond prices PDF may not be published yet, or extraction failed — '
+                'this section fails safe rather than showing a stale or guessed figure).</div>'
+                '</div>'
+            )
+            return page_intro + cbk_html + nse_html + self._bonds_glossary()
+
+        from bond_data import bond_market_verdict, recommend_bonds
+
+        verdict_html = ''
+        try:
+            verdict = bond_market_verdict(bonds)
+        except Exception as e:
+            logger.warning(f"Bonds page: verdict unavailable: {e}")
+            verdict = None
+        if verdict:
+            badge_class = {'buy': 'buy', 'hold': 'neutral', 'avoid': 'sell'}[verdict['verdict']]
+            verdict_html = (
+                '<div class="section"><h2>🎯 Is now a good time to buy bonds?</h2>'
+                f'<p><span class="badge {badge_class}">{verdict["label"]}</span> '
+                f'<span style="color:#475569;">{verdict["reason"]}</span></p></div>'
+            )
+
+        picks_html = ''
+        picks = recommend_bonds(bonds)
+        if picks:
+            cards = ''.join(
+                f'<div class="stat-card"><div class="stat-value" style="font-size:1.05rem;">{p["bond"]["issue_no"]}</div>'
+                f'<div class="stat-label">{p["label"]}<br>{p["bond"]["yield_pct"]:.2f}% yield · '
+                f'matures {p["bond"]["maturity_year"]}</div></div>'
+                for p in picks
+            )
+            picks_html = (
+                '<div class="section"><h2>🏆 Highest yield by time horizon</h2>'
+                f'<div class="stats">{cards}</div>'
+                '<div class="dq-note">Same issuer (Government of Kenya) in every bucket, so within a '
+                'time horizon the higher-yielding bond is the straightforward pick. This is not a '
+                'single "best bond overall" — that depends on when you actually need the money back.</div></div>'
+            )
+
+        rows = ''.join(
+            '<tr><td><strong>{issue_no}</strong></td><td>{issued}</td><td>{maturity}</td>'
+            '<td>{yld}</td><td>{coupon}</td><td>{cpn_pmt}</td><td>{clean}</td><td>{traded}</td></tr>'.format(
+                issue_no=b['issue_no'],
+                issued=b['issue_year'] if b.get('issue_year') is not None else '—',
+                maturity=b['maturity_year'] if b.get('maturity_year') is not None else '—',
+                yld=f"{b['yield_pct']:.2f}%" if b.get('yield_pct') is not None else '—',
+                coupon=f"{b['coupon_pct']:.2f}%" if b.get('coupon_pct') is not None else '—',
+                cpn_pmt=(f"KES {b['coupon_payment_per_50k']:,.2f} / 6mo"
+                         if b.get('coupon_payment_per_50k') is not None else '—'),
+                clean=f"{b['clean_price']:.2f}" if b.get('clean_price') is not None else '—',
+                traded=f"KES {b['value_traded']:,.0f}" if b.get('value_traded') is not None else '—',
+            )
+            for b in bonds
+        )
+        table_html = (
+            '<div class="section"><h2>📋 Actively Traded on NSE (Secondary Market)</h2>'
+            '<div class="filter-bar"><input type="text" id="search" '
+            'placeholder="🔍 Filter by bond..." oninput="filterTable()"></div>'
+            '<div class="table-wrap"><table id="mainTable"><thead><tr>'
+            '<th>Bond</th><th>Issued</th><th>Maturity</th><th>Yield</th><th>Coupon</th>'
+            '<th title="Paid semi-annually. Scaled to CBK\'s KES 50,000 minimum subscription">'
+            'Coupon Payment (per KES 50,000)</th>'
+            '<th>Clean Price</th><th>Value Traded</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table></div>'
+            '<div class="dq-note">Sorted by issue date, most recently issued first, then by yield. '
+            "Coupon Payment assumes CBK's KES 50,000 minimum subscription (Treasury/Infrastructure "
+            'bonds are bought in multiples of KES 50,000) — scale up for a larger holding, e.g. '
+            "double it for KES 100,000 invested. Machine-extracted from the NSE's daily bond prices "
+            'PDF (AWS Textract table extraction) — treat as approximate and verify before acting on '
+            'any figure.</div></div>'
+        )
+
+        return (
+            page_intro + cbk_html + verdict_html + picks_html + table_html
+            + self._bonds_glossary()
+        )
+
+    def _bonds_glossary(self):
+        """Plain-English guide for Government Bonds terms."""
+        cards = [
+            ("Primary vs. secondary market",
+             "Primary market (CBK auction) = brand-new bonds bought directly from the "
+             "government via DhowCSD, only open for about two weeks at a time. Secondary "
+             "market (NSE) = existing bonds bought from another investor via a stockbroker, "
+             "tradeable any day the market's open.",
+             "Missed the CBK auction window? You can usually still buy the same bond later "
+             "on the NSE, just at whatever price/yield the market is offering that day."),
+            ("DhowCSD",
+             "CBK's own online portal for buying Treasury/Infrastructure bonds directly at "
+             "auction, without going through a stockbroker.",
+             "You'd register a CSD account at dhowcsd.centralbank.go.ke to bid on a currently-"
+             "open auction like the one above."),
+            ("Coupon rate",
+             "The fixed annual interest rate the bond pays, as a % of its KES 100 face value.",
+             "13.44% coupon → the bond pays KES 13.44 a year for every KES 100 of face value, "
+             "split into two payments."),
+            ("Coupon payment",
+             "The actual cash paid out each period. NSE Treasury/Infrastructure bonds pay "
+             "semi-annually (twice a year), so each payment is half the annual coupon rate. "
+             "Shown here per CBK's KES 50,000 minimum subscription, not the KES 100 pricing "
+             "unit, since nobody actually holds KES 100 of a bond.",
+             "13.44% coupon on a KES 50,000 holding → KES 3,360 every six months "
+             "(KES 6.72 per KES 100 nominal × 500)."),
+            ("Yield",
+             "The return you'd actually earn buying at today's market price, unlike the coupon "
+             "rate which is fixed to the face value.",
+             "A bond trading below par (clean price 92) yields more than its coupon rate, since "
+             "you collect the same coupon on a cheaper purchase price."),
+            ("Clean price",
+             "The quoted trading price per KES 100 face value, excluding interest accrued since "
+             "the last coupon.",
+             "Clean price 98.50 → about KES 98.50 per KES 100 of face value, plus accrued "
+             "interest (the 'dirty' price) if bought between coupon dates."),
+            ("Maturity",
+             "The year the government repays the bond's full face value.",
+             "A bond maturing in 2033 returns your KES 100 principal in 2033, on top of every "
+             "coupon paid along the way."),
+            ("Why sorted by issue date",
+             "Newest issues are listed first so you can see what the government is currently "
+             "offering, rather than burying recent issuance under older, thinly-traded series.",
+             "A bond issued in 2026 appears above one issued in 2018, even if the 2018 bond "
+             "matures sooner."),
+        ]
+        items = ''
+        for title, what, eg in cards:
+            items += (f'<div class="explain-card"><h4>{title}</h4>'
+                      f'<p>{what}</p>'
+                      f'<p class="eg">📌 <strong>Example:</strong> {eg}</p></div>')
+        return ('<div class="section"><h2>📖 What these terms mean (plain English)</h2>'
+                '<p class="page-intro">No finance degree needed — each term explained simply, '
+                'with a worked example.</p>'
+                f'<div class="explain-grid">{items}</div></div>')
+
     def _build_foreign_flows_body(self, sym_td):
         """
         Build the Foreign Flows page body from the manual weekly input at
@@ -1401,6 +1963,7 @@ tr:hover { background: #f8fafc; }
         net_cls = ('positive' if (net or 0) > 0 else 'negative' if (net or 0) < 0 else 'neutral')
         net_word = ('NET BUY (inflow)' if (net or 0) > 0
                     else 'NET SELL (outflow)' if (net or 0) < 0 else 'FLAT')
+        pct_value = f'{pct:.1f}%' if pct is not None else '—'
         summary_html = (
             '<div class="stats">'
             f'<div class="stat-card"><div class="stat-value {net_cls}">{_fmt_m(net)}</div>'
@@ -1409,8 +1972,7 @@ tr:hover { background: #f8fafc; }
             f'<div class="stat-label">Foreign BUYS</div></div>'
             f'<div class="stat-card"><div class="stat-value bearish">{_fmt_m(sells)}</div>'
             f'<div class="stat-label">Foreign SELLS</div></div>'
-            f'<div class="stat-card"><div class="stat-value">{pct:.1f}%' if pct is not None else
-            f'<div class="stat-card"><div class="stat-value">—'
+            f'<div class="stat-card"><div class="stat-value">{pct_value}'
         )
         summary_html += (
             f'</div><div class="stat-label">Foreign participation</div></div>'
@@ -1471,12 +2033,12 @@ tr:hover { background: #f8fafc; }
             n = a.get('net_foreign_flow_kes')
             cls = 'positive' if (n or 0) > 0 else 'negative' if (n or 0) < 0 else ''
             p = a.get('foreign_participation_pct')
+            p_value = f'{p:.1f}%' if p is not None else '—'
             hist_rows += (f'<tr><td><strong>{w["week_ending"]}</strong></td>'
                           f'<td>{_fmt_m(a.get("foreign_buys_kes"))}</td>'
                           f'<td>{_fmt_m(a.get("foreign_sells_kes"))}</td>'
                           f'<td class="{cls}">{_fmt_m(n)}</td>'
-                          f'<td>{p:.1f}%' if p is not None else '<td>—')
-            hist_rows += '</td></tr>'
+                          f'<td>{p_value}</td></tr>')
         history_html = (
             '<div class="section"><h2>📜 History (all weeks)</h2>'
             '<div class="table-wrap"><table><thead><tr>'
@@ -1572,9 +2134,9 @@ tr:hover { background: #f8fafc; }
             '</div>'
         )
         if cbk.get('cbr_note'):
-            cbk_html += f'<p class="dq-note"><strong>MPC statement:</strong> {cbk["cbr_note"]}</p>'
+            cbk_html += f'<p class="dq-note"><strong>MPC statement:</strong> {_esc(cbk["cbr_note"])}</p>'
         if cbk.get('inflation_note'):
-            cbk_html += f'<p class="dq-note"><strong>Inflation:</strong> {cbk["inflation_note"]}</p>'
+            cbk_html += f'<p class="dq-note"><strong>Inflation:</strong> {_esc(cbk["inflation_note"])}</p>'
         cbk_html += (f'<p class="dq-note">Source: <a href="{cbk.get("source_url", "#")}" '
                      'target="_blank">centralbank.go.ke</a>. Higher CBR usually pressures bank '
                      "loan books but boosts their bond income; falling CBR is the reverse.</p></div>")
@@ -1669,11 +2231,11 @@ tr:hover { background: #f8fafc; }
                     src = n.get('source', '')
                     cards += (
                         f'<div class="alert-card">'
-                        f'<div class="items"><a href="{n["url"]}" target="_blank" '
+                        f'<div class="items"><a href="{_esc(n["url"])}" target="_blank" '
                         'style="color:#3b82f6; text-decoration:none; font-weight:600;">'
-                        f'{n["title"]}</a></div>'
+                        f'{_esc(n["title"])}</a></div>'
                         f'<div style="font-size:0.72rem; color:#94a3b8; margin-top:6px;">'
-                        f'{date_display} · {src}</div></div>'
+                        f'{_esc(date_display)} · {_esc(src)}</div></div>'
                     )
                 blocks += (f'<h3 class="cal-h3" style="margin-top:14px;">📰 {topic}</h3>'
                            f'<div class="alerts-grid">{cards}</div>')
@@ -1736,9 +2298,98 @@ tr:hover { background: #f8fafc; }
                 'These are heuristics, not rules — every situation has exceptions.</p>'
                 f'<div class="explain-grid">{items}</div></div>')
 
+    def _build_track_record_body(self, track_record_legacy=None, track_record_new=None):
+        """
+        Build the Track Record page: did the system's past calls actually
+        work? Two different signals are measured, each against its own
+        same-period market-average benchmark (see src/track_record.py) --
+        a tier that's merely tracking a rising market isn't evidence of
+        skill, so the benchmark row is shown right alongside it, not
+        buried in a footnote.
+
+        track_record_legacy / track_record_new: each {horizon_days:
+        {as_of, tiers, benchmark, note}}, keyed by the horizons computed
+        in aws/lambda_handler.py (see src/report_archive.py for the
+        legacy signal's source, src/signal_history.py for the new one).
+        None (e.g. a local run with no S3 archive to read) renders a
+        plain "not available" note instead of an empty page.
+        """
+        def _fmt_pct(v):
+            return f"{v:+.2f}%" if v is not None else '—'
+
+        def _fmt_hit(v):
+            return f"{v:.0f}%" if v is not None else '—'
+
+        def _one_table(result):
+            benchmark = result.get('benchmark') or {}
+            rows = (
+                '<tr><td><span class="badge neutral">Market avg</span></td>'
+                f'<td>{benchmark.get("n", 0)}</td><td>—</td>'
+                f'<td>{_fmt_pct(benchmark.get("avg_return_pct"))}</td></tr>'
+            )
+            for tier, t in (result.get('tiers') or {}).items():
+                rows += (
+                    f'<tr><td><span class="badge {tier}">{tier.replace("_", " ").title()}</span></td>'
+                    f'<td>{t.get("n", 0)}</td><td>{_fmt_hit(t.get("hit_rate"))}</td>'
+                    f'<td>{_fmt_pct(t.get("avg_return_pct"))}</td></tr>'
+                )
+            return (
+                f'<div class="table-wrap"><table><thead><tr>'
+                f'<th>Tier</th><th>Sample (stock-calls)</th><th>Hit rate</th><th>Avg return</th>'
+                f'</tr></thead><tbody>{rows}</tbody></table></div>'
+                f'<p class="dq-note">{_esc(result.get("note", ""))}</p>'
+            )
+
+        def _signal_section(title, description, by_horizon, since):
+            if not by_horizon:
+                return (
+                    f'<div class="section"><h2>{title}</h2>'
+                    f'<p class="page-intro">{description}</p>'
+                    '<p class="dq-note">Not available on this run.</p></div>'
+                )
+            horizon_html = ''
+            for h in sorted(by_horizon.keys()):
+                horizon_html += (
+                    f'<h3 style="font-size:0.85rem; margin:14px 0 8px;">{h} trading days later</h3>'
+                    + _one_table(by_horizon[h])
+                )
+            return (
+                f'<div class="section"><h2>{title}</h2>'
+                f'<p class="page-intro">{description} Measured since {_esc(since)}.</p>'
+                f'{horizon_html}</div>'
+            )
+
+        legacy_section = _signal_section(
+            '📈 Technical Signal — Bullish / Bearish',
+            "The system's own technical call (RSI, moving-average crossover, MACD, trend), "
+            "computed locally rather than pulled from TradingView. Mined from the daily "
+            "dashboard archive, so this has a real multi-week sample already.",
+            track_record_legacy or {},
+            '2026-07-30',
+        )
+        new_section = _signal_section(
+            '🎯 Literal Signal — Strong Buy / Buy / Neutral / Sell / Strong Sell',
+            "TradingView's own live technical-rating tag — the same one shown in the daily "
+            "email and the recommender's budget feature. Its history only started being saved "
+            "recently, so this will be thin for a while by design (see the note under each table).",
+            track_record_new or {},
+            '2026-09-21',
+        )
+
+        return (
+            '<p class="page-intro">Does the system\'s Buy/Strong Buy signal actually make '
+            "money? Every tier below is shown next to the market average over the exact same "
+            "stocks and dates — a tier that's just tracking a rising market isn't evidence of "
+            'skill, so that comparison is never hidden. This is a mechanical screen, not '
+            'investment advice.</p>'
+            + legacy_section + new_section
+        )
+
     def _build_dashboard_pages(self, stocks, gainers, losers, sectors, breadth,
                                sector_chart, bullish, bearish, neutral, total,
-                               data_date=None, alerts=None, usd_kes=None):
+                               data_date=None, alerts=None, usd_kes=None, bonds=None,
+                               cbk_auctions=None, track_record_legacy=None,
+                               track_record_new=None):
         """
         Build the multi-page dashboard: a clean Overview plus grouped detail
         pages (Technicals, Fundamentals, Dividends, Sectors, Data Quality).
@@ -1779,7 +2430,16 @@ tr:hover { background: #f8fafc; }
             if sc is None:
                 return '<td>—</td>'
             c = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
-            return f'<td><span class="score {c}">{sc}</span></td>'
+            coverage = s.get('score_coverage')
+            fp, ft = s.get('score_factors'), s.get('score_factors_total')
+            # Below 60% weight-coverage, the score leans on too few factors
+            # to trust at face value -- flag it rather than show a clean number.
+            partial = coverage is not None and coverage < 60
+            cls = f'score {c} partial' if partial else f'score {c}'
+            title = (f' title="Based on {fp}/{ft} factors ({coverage}% of factor weight had data)"'
+                     if fp is not None else '')
+            flag = ' <span class="score-flag">△</span>' if partial else ''
+            return f'<td><span class="{cls}"{title}>{sc}{flag}</span></td>'
 
         def sym_td(s):
             link = s['report_file'] if s['report_file'] else '#'
@@ -1830,7 +2490,7 @@ tr:hover { background: #f8fafc; }
             + search_bar +
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
             '<th>Symbol</th><th title="TradingView Buy/Sell rating">TV Signal</th><th>Price</th>'
-            '<th>Change</th><th title="0-100 factor screen">Score</th>'
+            '<th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
             f'</tr></thead><tbody>{ov_rows}</tbody></table></div></div>')
 
         # ---- TECHNICALS page ----
@@ -1860,17 +2520,17 @@ tr:hover { background: #f8fafc; }
 
         fund_rows = ''
         for s in stocks:
-            pe = f"{s['pe_ratio']:.1f}" if s['pe_ratio'] else '—'
-            peg = f"{s['peg_ratio']:.2f}" if s.get('peg_ratio') else '—'
-            pb = f"{s['price_to_book']:.2f}" if s.get('price_to_book') else '—'
+            pe = f"{s['pe_ratio']:.1f}" if s.get('pe_ratio') is not None else '—'
+            peg = f"{s['peg_ratio']:.2f}" if s.get('peg_ratio') is not None else '—'
+            pb = f"{s['price_to_book']:.2f}" if s.get('price_to_book') is not None else '—'
             eps = f"{s['eps']:.2f}" if s.get('eps') is not None else '—'
-            mcap = self._fmt_mcap(s['market_cap']) if s.get('market_cap') else '—'
+            mcap = self._fmt_mcap(s['market_cap']) if s.get('market_cap') is not None else '—'
             roe = f"{s['roe']:.1f}%" if s.get('roe') is not None else '—'
             nm = f"{s['net_margin']:.1f}%" if s.get('net_margin') is not None else '—'
             de = f"{s['debt_to_equity']:.2f}" if s.get('debt_to_equity') is not None else '—'
             rg = s.get('revenue_growth')
             rg_str = f"{rg:+.1f}%" if rg is not None else '—'
-            dy = f"{s['dividend_yield']:.1f}%" if s.get('dividend_yield') else '—'
+            dy = f"{s['dividend_yield']:.1f}%" if s.get('dividend_yield') is not None else '—'
             fund_rows += (
                 f'<tr>{sym_td(s)}<td>{price_cell(s)}</td><td class="mcap-cell">{mcap}</td>'
                 f'<td class="{fcls("pe", s.get("pe_ratio"))}">{pe}</td>'
@@ -1892,7 +2552,8 @@ tr:hover { background: #f8fafc; }
             '<th title="P/E adjusted for growth">PEG</th><th title="Price / Book value">P/B</th>'
             '<th title="Earnings per share">EPS</th><th title="Return on Equity">ROE</th>'
             '<th title="Net profit margin">Net Margin</th><th title="Debt / Equity">D/E</th>'
-            '<th title="Revenue growth vs last year">Rev Growth</th><th>Yield</th><th>Score</th>'
+            '<th title="Revenue growth vs last year">Rev Growth</th><th>Yield</th>'
+            '<th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
             f'</tr></thead><tbody>{fund_rows}</tbody></table></div></div>'
             + self._fundamentals_explainer())
 
@@ -2109,7 +2770,8 @@ tr:hover { background: #f8fafc; }
             + search_bar +
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
             '<th>Symbol</th><th>Earnings Date</th><th>When</th>'
-            '<th>Price</th><th>Change</th><th>TV Signal</th><th>Score</th>'
+            '<th>Price</th><th>Change</th><th>TV Signal</th>'
+            '<th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
             f'</tr></thead><tbody>{earnings_rows}</tbody></table></div>'
             f'<div class="dq-note">{len(earnings_rows_raw)} stock(s) with an upcoming '
             'earnings release. Earnings dates are only published for a subset of NSE stocks; '
@@ -2121,6 +2783,9 @@ tr:hover { background: #f8fafc; }
             'in Gmail you can also click "Add to calendar" directly on the message.</div>'
             '</div>')
 
+        # ---- GOVERNMENT BONDS page ----
+        bonds_body = self._build_bonds_body(bonds, cbk_auctions)
+
         # ---- FOREIGN FLOWS page (manual weekly input) ----
         foreign_body = self._build_foreign_flows_body(sym_td)
 
@@ -2131,488 +2796,28 @@ tr:hover { background: #f8fafc; }
             )
         )
 
+        # ---- TRACK RECORD page (did past calls actually work?) ----
+        track_record_body = self._build_track_record_body(track_record_legacy, track_record_new)
+
         # ---- Assemble & write all pages ----
         pages = {
             'index.html': self._page_shell('NSE Dashboard — Overview', 'index.html', subtitle, overview_body, with_filter=True),
             'technicals.html': self._page_shell('NSE — Technicals', 'technicals.html', subtitle, technicals_body, with_filter=True),
             'fundamentals.html': self._page_shell('NSE — Fundamentals', 'fundamentals.html', subtitle, fundamentals_body, with_filter=True),
             'dividends.html': self._page_shell('NSE — Dividends', 'dividends.html', subtitle, dividends_body, with_filter=True),
+            'bonds.html': self._page_shell('NSE — Government Bonds', 'bonds.html', subtitle, bonds_body, with_filter=True),
             'earnings.html': self._page_shell('NSE — Next Earnings', 'earnings.html', subtitle, earnings_body, with_filter=True),
             'sectors.html': self._page_shell('NSE — Sectors', 'sectors.html', subtitle, sectors_body),
             'foreign.html': self._page_shell('NSE — Foreign Flows', 'foreign.html', subtitle, foreign_body),
             'pulse.html': self._page_shell('NSE — Market Pulse', 'pulse.html', subtitle, pulse_body),
             'quality.html': self._page_shell('NSE — Data Quality', 'quality.html', subtitle, quality_body),
+            'track_record.html': self._page_shell('NSE — Track Record', 'track_record.html', subtitle, track_record_body),
         }
         for filename, html in pages.items():
             with open(os.path.join(self.output_dir, filename), 'w', encoding='utf-8') as f:
                 f.write(html)
         logger.info(f"Dashboard saved: {len(pages)} pages — {', '.join(pages.keys())}")
         return os.path.join(self.output_dir, 'index.html')
-
-    def _build_index_html(self, stocks, gainers, losers, sectors, breadth,
-                          sector_chart, bullish, bearish, neutral, total,
-                          data_date=None, alerts=None, usd_kes=None):
-        """[DEPRECATED — replaced by _build_dashboard_pages] Kept for reference."""
-        now = datetime.now().strftime('%Y-%m-%d %H:%M EAT')
-        data_date_str = data_date or datetime.now().strftime('%Y-%m-%d')
-
-        # ---- Data-quality summary (price validation) ----
-        v_ok = v_mismatch = v_stale = v_unverified = 0
-        mismatch_list = []
-        for s in stocks:
-            st = (s.get('validation') or {}).get('status')
-            if st == 'ok':
-                v_ok += 1
-            elif st == 'mismatch':
-                v_mismatch += 1
-                mismatch_list.append(s)
-            elif st == 'stale':
-                v_stale += 1
-            else:
-                v_unverified += 1
-
-        # Price-validation marker per status
-        pv_marker = {
-            'ok': ('✓', '#16a34a', 'Verified against independent source'),
-            'mismatch': ('❗', '#dc2626', ''),
-            'stale': ('🕒', '#d97706', ''),
-            'unverified': ('', '#94a3b8', 'No independent source to compare'),
-        }
-
-        # Build stock rows
-        stock_rows = ''
-        for s in stocks:
-            chg_class = 'positive' if (s['change'] or 0) >= 0 else 'negative'
-            chg_str = f"{s['change']:+.2f}%" if s['change'] is not None else '—'
-            price_str = f"{s['price']:.2f}" if s['price'] else '—'
-            rsi_str = f"{s['rsi']:.1f}" if s['rsi'] else '—'
-            pe_str = f"{s['pe_ratio']:.1f}" if s['pe_ratio'] else '—'
-            mcap_str = self._fmt_mcap(s['market_cap']) if s.get('market_cap') else '—'
-            link = s['report_file'] if s['report_file'] else '#'
-
-            # Dividend yield
-            dy = s.get('dividend_yield')
-            dy_str = f"{dy:.1f}%" if dy else '—'
-
-            # Dividend amount (KES/share) — 0 when the stock pays nothing
-            dps = s.get('dps')
-            if dps and dps > 0:
-                div_html = f'<span class="div-pay">{dps:g}</span>'
-            else:
-                div_html = '<span class="div-zero">0</span>'
-
-            # Ex-dividend date — upcoming (still buyable) vs past vs none
-            ex_date = s.get('ex_date')
-            if ex_date and s.get('ex_upcoming'):
-                exdate_html = f'<span class="exdate-upcoming" title="Buy before this date to receive the dividend">{ex_date}</span>'
-            elif ex_date:
-                exdate_html = f'<span class="exdate-past" title="Most recent ex-dividend date (already passed)">{ex_date}</span>'
-            else:
-                exdate_html = '<span class="exdate-none">—</span>'
-
-            # Score badge (colour by band)
-            score = s.get('score')
-            if score is None:
-                score_html = '—'
-            else:
-                sc_class = 'score-high' if score >= 70 else 'score-mid' if score >= 45 else 'score-low'
-                score_html = f'<span class="score {sc_class}">{score}</span>'
-
-            # Price-validation marker (with tooltip)
-            val = s.get('validation') or {}
-            status = val.get('status', 'unverified')
-            mark, color, default_tip = pv_marker.get(status, ('', '#94a3b8', ''))
-            tip = val.get('note') or default_tip
-            mark_html = (f'<span class="pv-mark" style="color:{color}" title="{tip}">{mark}</span>'
-                         if mark else '')
-
-            stock_rows += f'''
-            <tr>
-                <td><a href="{link}" class="stock-link"><strong>{s['symbol']}</strong></a></td>
-                <td><span class="badge {s['signal_class']}">{s['signal_label']}</span></td>
-                <td>{price_str} {mark_html}</td>
-                <td class="{chg_class}">{chg_str}</td>
-                <td>{dy_str}</td>
-                <td>{div_html}</td>
-                <td>{exdate_html}</td>
-                <td>{pe_str}</td>
-                <td class="mcap-cell">{mcap_str}</td>
-                <td>{rsi_str}</td>
-                <td><span class="badge {s['trend']}">{s['trend']}</span></td>
-                <td><span class="badge {s['ma']}">{s['ma'].replace('_',' ')}</span></td>
-                <td><span class="badge {s['macd']}">{s['macd'].replace('_',' ')}</span></td>
-                <td><span class="badge {s['stochastic']}">{s['stochastic']}</span></td>
-                <td><span class="badge {s['volume_signal']}">{s['volume_signal'].replace('_',' ')}</span></td>
-                <td><span class="badge {s['overall']}">{s['overall']}</span></td>
-                <td>{score_html}</td>
-            </tr>'''
-
-        # Build gainer/loser rows
-        gainer_rows = ''.join(
-            f'<tr><td>{g["symbol"]}</td><td class="positive">{g["change"]:+.2f}%</td></tr>'
-            for g in gainers[:10]
-        )
-        loser_rows = ''.join(
-            f'<tr><td>{l["symbol"]}</td><td class="negative">{l["change"]:+.2f}%</td></tr>'
-            for l in losers[:10]
-        )
-
-        # Build sector cards
-        sector_cards = ''
-        if sectors:
-            for name, data in sectors.items():
-                chg = data['avg_change_pct']
-                cls = 'positive' if chg >= 0 else 'negative'
-                sector_cards += f'''
-                <div class="sector-card">
-                    <h3>{name}</h3>
-                    <div class="sector-change {cls}">{chg:+.2f}%</div>
-                    <div class="sector-detail">{data['count']} stocks | RSI {data.get('avg_rsi', '—')} | {data['bullish_ratio']}% bullish</div>
-                </div>'''
-
-        # Breadth stats
-        breadth_html = ''
-        if breadth:
-            for key, label in [
-                ('pct_above_sma50', 'Above SMA50'),
-                ('pct_bullish_macd', 'Bullish MACD'),
-                ('pct_rsi_above_50', 'RSI > 50'),
-            ]:
-                if key in breadth:
-                    breadth_html += f'''
-                    <div class="stat-card">
-                        <div class="stat-value">{breadth[key]}%</div>
-                        <div class="stat-label">{label}</div>
-                    </div>'''
-
-        sector_chart_html = ''
-        if sector_chart:
-            sector_chart_html = f'<img src="data:image/png;base64,{sector_chart}" class="chart-img" alt="Sector Performance">'
-
-        # ---- Alerts section ----
-        alerts_html = ''
-        if alerts:
-            cards = ''
-            for sym in sorted(alerts.keys()):
-                items = alerts[sym]
-                if not items:
-                    continue
-                items_html = '<br>'.join(items)
-                cards += (f'<div class="alert-card"><div class="sym">{sym}</div>'
-                          f'<div class="items">{items_html}</div></div>')
-            if cards:
-                alerts_html = f'''
-<div class="section">
-    <h2>🔔 Alerts &amp; Signals</h2>
-    <div class="alerts-grid">{cards}</div>
-</div>'''
-
-        # ---- Data-quality section (price validation) ----
-        dq_html = ''
-        if (v_ok + v_mismatch + v_stale + v_unverified) > 0:
-            mismatch_note = ''
-            if mismatch_list:
-                items = ', '.join(
-                    f"{m['symbol']} ({(m.get('validation') or {}).get('pct_diff'):+.1f}%)"
-                    for m in mismatch_list
-                )
-                mismatch_note = (f'<div class="dq-note dq-mismatch">⚠️ TradingView differs from '
-                                 f'the NSE official close for: {items}</div>')
-            dq_html = f'''
-<div class="section">
-    <h2>✅ Data Quality</h2>
-    <div class="stats">
-        <div class="stat-card"><div class="stat-value bullish">{v_ok}</div><div class="stat-label">Verified</div></div>
-        <div class="stat-card"><div class="stat-value bearish">{v_mismatch}</div><div class="stat-label">Price mismatch</div></div>
-        <div class="stat-card"><div class="stat-value neutral">{v_stale}</div><div class="stat-label">Stale / thin</div></div>
-        <div class="stat-card"><div class="stat-value">{v_unverified}</div><div class="stat-label">Unverified</div></div>
-    </div>
-    <div class="dq-note">Prices shown are the <strong>NSE official close</strong> (afx.kwayisi.org), cross-checked against TradingView.
-    ✓ = TradingView confirms it · ❗ = TradingView differs (price uncertain) · 🕒 = last traded &gt;1 day ago.</div>
-    {mismatch_note}
-</div>'''
-
-        # ---- FX chip for the header ----
-        fx_html = ''
-        if usd_kes and usd_kes.get('rate'):
-            fx_html = f" · 💵 USD/KES {usd_kes['rate']:.2f}"
-
-        # ---- Dividend calendar (ex-dividend dates, colour-coded by proximity) ----
-        today = datetime.now().date()
-        cal_rows = []
-        for s in stocks:
-            ex = s.get('ex_date')
-            if not ex:
-                continue
-            try:
-                d = datetime.strptime(ex, '%Y-%m-%d').date()
-            except (ValueError, TypeError):
-                continue
-            delta = (d - today).days
-            if delta < 0:
-                cls, when, group, sortk = 'cal-passed', f'{-delta}d ago', 'past', -delta
-            elif delta <= 30:
-                cls, when, group, sortk = 'cal-near', (f'in {delta}d' if delta else 'today'), 'up', delta
-            else:
-                cls, when, group, sortk = 'cal-far', f'in {delta}d', 'up', delta
-            cal_rows.append({
-                'symbol': s['symbol'], 'dps': s.get('dps'),
-                'yield': s.get('dividend_yield'), 'ex': ex,
-                'cls': cls, 'when': when, 'group': group, 'sortk': sortk,
-            })
-
-        def _cal_table(rows, empty_msg):
-            if not rows:
-                return f'<p class="dq-note">{empty_msg}</p>'
-            body = ''
-            for r in rows:
-                dps = f"{r['dps']:g}" if r['dps'] else '0'
-                yld = f"{r['yield']:.1f}%" if r['yield'] else '—'
-                body += (f'<tr><td><strong>{r["symbol"]}</strong></td>'
-                         f'<td>{dps}</td><td>{yld}</td>'
-                         f'<td><span class="cal-chip {r["cls"]}">{r["ex"]}</span></td>'
-                         f'<td>{r["when"]}</td></tr>')
-            return ('<table><thead><tr><th>Symbol</th><th>Div KES</th><th>Yield</th>'
-                    f'<th>Ex-Date</th><th>When</th></tr></thead><tbody>{body}</tbody></table>')
-
-        upcoming = sorted([r for r in cal_rows if r['group'] == 'up'], key=lambda r: r['sortk'])
-        past = sorted([r for r in cal_rows if r['group'] == 'past'], key=lambda r: r['sortk'])
-        dividend_calendar_html = f'''
-<div class="section">
-    <h2>💵 Dividend Calendar</h2>
-    <div class="cal-legend">
-        <span class="cal-chip cal-near">soon (≤30d)</span>
-        <span class="cal-chip cal-far">later (&gt;30d)</span>
-        <span class="cal-chip cal-passed">passed</span>
-    </div>
-    <div class="grid-2">
-        <div>
-            <h3 class="cal-h3">🟢 Upcoming Ex-Dividend Dates <span class="cal-count">({len(upcoming)})</span></h3>
-            <div class="table-wrap">{_cal_table(upcoming, "No upcoming ex-dividend dates in the current data.")}</div>
-        </div>
-        <div>
-            <h3 class="cal-h3">🔴 Past Ex-Dividend Dates <span class="cal-count">({len(past)})</span></h3>
-            <div class="table-wrap">{_cal_table(past, "No past ex-dividend dates recorded.")}</div>
-        </div>
-    </div>
-    <div class="dq-note">Buy <strong>before</strong> a green/yellow ex-date to receive that dividend. Div KES = dividend per share for the year (0 = none).</div>
-    <div class="dq-note dq-mismatch">⚠️ Dividend <strong>payment dates</strong> are not published by our data feed (TradingView provides ex-dividend dates only, and free NSE sources checked were stale). On the NSE, payment typically follows the ex-date by ~3–8 weeks — confirm the exact date in the company's official NSE announcement.</div>
-</div>'''
-
-        return f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NSE Daily Dashboard — {now}</title>
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; color: #1e293b; }}
-.container {{ max-width: 1400px; margin: 0 auto; padding: 20px; }}
-
-/* Header */
-.header {{ background: linear-gradient(135deg, #0f172a, #1e293b); color: white; padding: 30px; border-radius: 12px; margin-bottom: 20px; text-align: center; }}
-.header h1 {{ font-size: 2rem; margin-bottom: 5px; }}
-.header .date {{ color: #94a3b8; font-size: 0.9rem; }}
-
-/* Stats row */
-.stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 20px; }}
-.stat-card {{ background: white; padding: 16px; border-radius: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }}
-.stat-card .stat-value {{ font-size: 1.8rem; font-weight: 700; }}
-.stat-card .stat-label {{ font-size: 0.75rem; color: #64748b; text-transform: uppercase; margin-top: 4px; }}
-.stat-card .bullish {{ color: #22c55e; }}
-.stat-card .bearish {{ color: #ef4444; }}
-.stat-card .neutral {{ color: #f59e0b; }}
-
-/* Section */
-.section {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }}
-.section h2 {{ font-size: 1.1rem; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 2px solid #3b82f6; display: inline-block; }}
-
-/* Table */
-.table-wrap {{ overflow-x: auto; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-th, td {{ padding: 8px 10px; text-align: left; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
-th {{ background: #f8fafc; color: #64748b; font-size: 0.7rem; text-transform: uppercase; font-weight: 600; position: sticky; top: 0; }}
-tr:hover {{ background: #f8fafc; }}
-.stock-link {{ color: #3b82f6; text-decoration: none; font-weight: 600; }}
-.stock-link:hover {{ text-decoration: underline; }}
-
-/* Badges */
-.badge {{ padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: 600; text-transform: capitalize; }}
-.bullish, .golden_cross, .bullish_cross, .oversold, .buy {{ background: #dcfce7; color: #166534; }}
-.bearish, .death_cross, .bearish_cross, .overbought, .sell {{ background: #fee2e2; color: #991b1b; }}
-.neutral, .within_bands, .normal {{ background: #fef3c7; color: #92400e; }}
-.strong_buy {{ background: #16a34a; color: #ffffff; }}
-.strong_sell {{ background: #dc2626; color: #ffffff; }}
-
-/* Score chips */
-.score {{ display: inline-block; min-width: 30px; padding: 2px 8px; border-radius: 10px; font-weight: 700; font-size: 0.75rem; text-align: center; }}
-.score-high {{ background: #dcfce7; color: #166534; }}
-.score-mid {{ background: #fef3c7; color: #92400e; }}
-.score-low {{ background: #fee2e2; color: #991b1b; }}
-.pv-mark {{ font-size: 0.75rem; cursor: help; }}
-
-/* Dividend amount (teal "money" highlight) vs 0 (muted) */
-.div-pay {{ display: inline-block; padding: 2px 8px; border-radius: 10px; background: #ccfbf1; color: #0f766e; font-weight: 700; }}
-.div-zero {{ display: inline-block; padding: 2px 8px; border-radius: 10px; background: #f1f5f9; color: #94a3b8; font-weight: 600; }}
-/* Ex-dividend date — a different colour family from the amount */
-.exdate-upcoming {{ display: inline-block; padding: 2px 8px; border-radius: 10px; background: #16a34a; color: #ffffff; font-weight: 700; cursor: help; }}
-.exdate-past {{ display: inline-block; padding: 2px 8px; border-radius: 10px; background: #e0e7ff; color: #3730a3; font-weight: 600; cursor: help; }}
-.exdate-none {{ color: #cbd5e1; }}
-
-/* Dividend calendar chips: green=soon, yellow=later, red=passed */
-.cal-chip {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-weight: 700; font-size: 0.78rem; }}
-.cal-near {{ background: #16a34a; color: #ffffff; }}
-.cal-far {{ background: #fde68a; color: #92400e; }}
-.cal-passed {{ background: #fecaca; color: #991b1b; }}
-.cal-legend {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }}
-.cal-h3 {{ font-size: 0.95rem; margin-bottom: 10px; }}
-.cal-count {{ color: #94a3b8; font-weight: 400; }}
-
-/* Alerts */
-.alerts-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }}
-.alert-card {{ background: #f8fafc; border: 1px solid #e2e8f0; border-left: 3px solid #3b82f6; border-radius: 8px; padding: 10px 12px; }}
-.alert-card .sym {{ font-weight: 700; color: #3b82f6; margin-bottom: 4px; }}
-.alert-card .items {{ font-size: 0.8rem; color: #475569; line-height: 1.5; }}
-.dq-note {{ font-size: 0.8rem; color: #64748b; margin-top: 8px; }}
-.dq-mismatch {{ color: #991b1b; }}
-.undefined {{ background: #f1f5f9; color: #64748b; }}
-.high_volume {{ background: #ede9fe; color: #5b21b6; }}
-.low_volume {{ background: #f1f5f9; color: #64748b; }}
-
-/* Market cap */
-.mcap-cell {{ font-size: 0.8rem; color: #475569; white-space: nowrap; }}
-
-/* Changes */
-.positive {{ color: #22c55e; font-weight: 600; }}
-.negative {{ color: #ef4444; font-weight: 600; }}
-
-/* Grid layouts */
-.grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
-.grid-3 {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }}
-
-/* Sector cards */
-.sector-card {{ background: #f8fafc; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; }}
-.sector-card h3 {{ font-size: 0.9rem; margin-bottom: 4px; }}
-.sector-change {{ font-size: 1.3rem; font-weight: 700; }}
-.sector-detail {{ font-size: 0.75rem; color: #64748b; margin-top: 4px; }}
-
-/* Chart */
-.chart-img {{ max-width: 100%; border-radius: 8px; margin-top: 12px; }}
-
-/* Filter */
-.filter-bar {{ margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap; }}
-.filter-bar input {{ padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.9rem; width: 200px; }}
-.filter-bar select {{ padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.9rem; }}
-
-/* Footer */
-.footer {{ text-align: center; padding: 20px; color: #94a3b8; font-size: 0.8rem; }}
-
-@media (max-width: 768px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
-</style>
-</head>
-<body>
-<div class="container">
-
-<div class="header">
-    <h1>🇰🇪 NSE Daily Dashboard</h1>
-    <div class="date">{now} · {total} stocks analyzed · 📅 Financial data: {data_date_str} · Prices: NSE official close · Fundamentals: TradingView{fx_html}</div>
-</div>
-
-<!-- Market Stats -->
-<div class="stats">
-    <div class="stat-card"><div class="stat-value">{total}</div><div class="stat-label">Stocks</div></div>
-    <div class="stat-card"><div class="stat-value bullish">{bullish}</div><div class="stat-label">Bullish</div></div>
-    <div class="stat-card"><div class="stat-value bearish">{bearish}</div><div class="stat-label">Bearish</div></div>
-    <div class="stat-card"><div class="stat-value neutral">{neutral}</div><div class="stat-label">Neutral</div></div>
-    {breadth_html}
-</div>
-
-{dq_html}
-
-{dividend_calendar_html}
-
-{alerts_html}
-
-<!-- Sector Performance -->
-<div class="section">
-    <h2>📊 Sector Performance</h2>
-    <div class="grid-3">{sector_cards}</div>
-    {sector_chart_html}
-</div>
-
-<!-- Top Movers -->
-<div class="grid-2">
-    <div class="section">
-        <h2>🟢 Top Gainers</h2>
-        <table><tr><th>Symbol</th><th>Change</th></tr>{gainer_rows}</table>
-    </div>
-    <div class="section">
-        <h2>🔴 Top Losers</h2>
-        <table><tr><th>Symbol</th><th>Change</th></tr>{loser_rows}</table>
-    </div>
-</div>
-
-<!-- All Stocks -->
-<div class="section">
-    <h2>📋 All Stocks</h2>
-    <div class="filter-bar">
-        <input type="text" id="search" placeholder="🔍 Filter stocks..." oninput="filterTable()">
-        <select id="signalFilter" onchange="filterTable()">
-            <option value="">All Signals</option>
-            <option value="bullish">Bullish</option>
-            <option value="bearish">Bearish</option>
-            <option value="neutral">Neutral</option>
-        </select>
-    </div>
-    <div class="table-wrap">
-        <table id="stockTable">
-            <thead>
-                <tr>
-                    <th>Symbol</th>
-                    <th title="TradingView technical rating — Buy / Sell / Neutral">TV Signal</th>
-                    <th>Price</th><th>Change</th>
-                    <th title="Dividend yield">Yield</th>
-                    <th title="Dividend per share (KES). 0 = no dividend">Div KES</th>
-                    <th title="Ex-dividend date. Green = upcoming (buy before it to receive the dividend)">Ex-Div Date</th>
-                    <th>P/E</th><th>Market Cap</th>
-                    <th>RSI</th><th>Trend</th><th>MA</th><th>MACD</th><th>Stoch</th><th>Vol</th>
-                    <th>Overall</th>
-                    <th title="Transparent 0-100 factor screen (value, quality, momentum, dividend, liquidity)">Score</th>
-                </tr>
-            </thead>
-            <tbody>{stock_rows}</tbody>
-        </table>
-    </div>
-</div>
-
-<div class="footer">Generated by Kenyan Stock Analyzer · Click any stock symbol to view detailed report</div>
-
-</div>
-
-<script>
-function filterTable() {{
-    const search = document.getElementById('search').value.toLowerCase();
-    const signal = document.getElementById('signalFilter').value.toLowerCase();
-    const rows = document.querySelectorAll('#stockTable tbody tr');
-    rows.forEach(row => {{
-        const text = row.textContent.toLowerCase();
-        const overall = row.querySelector('.badge:last-child')?.textContent.toLowerCase() || '';
-        const matchSearch = !search || text.includes(search);
-        const matchSignal = !signal || overall.includes(signal);
-        row.style.display = (matchSearch && matchSignal) ? '' : 'none';
-    }});
-}}
-</script>
-</body>
-</html>'''
-        """Render a Jinja2 template, falling back to inline if file missing."""
-        try:
-            template = self.env.get_template(template_name)
-            return template.render(**data)
-        except Exception as e:
-            logger.warning(f"Template {template_name} not found: {e}")
-            return self._fallback_html(template_name, data)
 
     def _render(self, template_name, data):
         """Render a Jinja2 template, falling back to inline if file missing."""
