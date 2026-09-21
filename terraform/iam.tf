@@ -27,6 +27,32 @@ resource "aws_iam_role_policy" "lambda_exec" {
         Resource = "${aws_s3_bucket.reports.arn}/*"
       },
       {
+        # Read back the accumulated history/<date>.json signal snapshots
+        # (src/signal_history.py) to compute the tv_class track record in
+        # src/track_record.py, and the market_summary_*.html archive
+        # (src/report_archive.py) to compute the Track Record page's older
+        # bullish/bearish signal from the ~7 weeks of it that predate
+        # history/ -- the Lambda has only ever needed to write before now.
+        Sid    = "ReadSignalHistory"
+        Effect = "Allow"
+        Action = ["s3:GetObject"]
+        Resource = [
+          "${aws_s3_bucket.reports.arn}/history/*",
+          "${aws_s3_bucket.reports.arn}/market_summary_*",
+        ]
+      },
+      {
+        Sid      = "ListSignalHistory"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.reports.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = ["history/*", "market_summary_*"]
+          }
+        }
+      },
+      {
         Sid      = "SendSummaryEmail"
         Effect   = "Allow"
         Action   = ["ses:SendEmail", "ses:SendRawEmail"]

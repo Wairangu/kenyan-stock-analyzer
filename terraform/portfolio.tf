@@ -134,6 +134,7 @@ resource "aws_lambda_function" "portfolio" {
       TRADES_PREFIX        = "trades/"
       USERS_KEY            = "users.json"
       PRICES_URL           = "https://stocks.getkitters.com/prices.json"
+      RECOMMENDATIONS_URL  = "https://stocks.getkitters.com/recommendations.json"
       SSM_PREFIX           = "/kenyan-stock-portfolio"
       ORIGIN_VERIFY_SECRET = random_password.portfolio_origin_secret.result
       # Approximate NSE broker commission + statutory levies (CDSC/NSE/CMA),

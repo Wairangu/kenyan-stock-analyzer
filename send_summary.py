@@ -201,10 +201,18 @@ def main():
         return
 
     from email_notifier import EmailNotifier
+    from recommender import build_candidate_list
     notifier = EmailNotifier(config)
+    candidates = build_candidate_list(analysis_results, fundamentals_data, scores)
+    # No persisted S3 signal history from this standalone script (that's the
+    # deployed Lambda's job -- see aws/lambda_handler.py), so there's
+    # honestly nothing to show here yet.
+    track_record = {
+        "horizon_days": 10, "as_of": None, "tiers": {},
+        "note": "Track record isn't available from this script -- see the deployed dashboard.",
+    }
     body = notifier.generate_email_body(
-        analysis_results, sector_data, breadth,
-        fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
+        candidates=candidates, track_record=track_record, bonds=bonds,
     )
     attachments = [pdf_path] if pdf_path else []
     if ics_path and os.path.exists(ics_path):

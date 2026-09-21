@@ -13,7 +13,6 @@ from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime
 from logger import get_logger
-from fundamental_analysis import FundamentalAnalysis
 
 logger = get_logger(__name__)
 
@@ -122,33 +121,32 @@ class EmailNotifier:
             logger.error(f"Failed to send email: {e}")
             return False
 
-    def generate_email_body(self, analysis_results, sector_data=None,
-                            breadth=None, dashboard_url=None,
-                            fundamentals_data=None, scores=None, bonds=None,
-                            cbk_auctions=None):
+    def generate_email_body(self, dashboard_url=None, candidates=None,
+                            track_record=None, bonds=None, cbk_auctions=None):
         """
-        Generate a compact HTML email body with market summary.
+        Generate a short "what to buy today" HTML email -- not the full
+        dashboard. Just today's ranked Buy/Strong Buy candidates (see
+        src/recommender.py), how the system's past calls have actually
+        performed (src/track_record.py), and the fixed-income sections
+        (CBK auctions / NSE bonds), which are a separate concern from
+        stock picks and stay as-is.
 
-        Visually matches the dashboard's look and feel -- same color
-        palette (bullish/bearish greens & reds, navy/teal/amber header
-        gradient) as templates/base.html -- kept to email-client-safe CSS
-        (no CSS custom properties, animations, or backdrop-filter, since
-        those aren't reliably supported by mail clients).
+        Kept to email-client-safe CSS (no CSS custom properties,
+        animations, or backdrop-filter, since those aren't reliably
+        supported by mail clients).
 
         Args:
-            analysis_results: dict from AnalysisEngine.
-            sector_data: dict from SectorAnalyzer.
-            breadth: dict from AnalysisEngine.calculate_market_breadth.
             dashboard_url: optional URL to the full hosted dashboard.
                 Shown as a button under the header and linked in the
                 footer. Omitted entirely when not provided (e.g. local
                 runs with no hosted dashboard).
-            fundamentals_data: dict from FundamentalAnalysis.fetch_all_fundamentals(),
-                used for the TradingView Buy/Sell signal column. Stocks
-                render as "N/A" for that column when omitted.
-            scores: dict from scoring.score_stock() per symbol, used for
-                the Score column. Stocks render "—" for that column when
-                omitted.
+            candidates: ranked list from recommender.build_candidate_list()
+                -- {symbol, price, tv_label, tv_class, score, score_coverage}.
+                Empty/omitted renders "No Buy or Strong Buy signals today."
+            track_record: dict from track_record.compute_track_record() --
+                {horizon_days, as_of, tiers, note}. Always shown, even
+                when there isn't enough history yet, rather than hiding a
+                thin sample behind a confident-looking number.
             bonds: list of dicts from bond_data.fetch_active_government_bonds(),
                 the government bonds that actually traded on the NSE the
                 previous session. Section is omitted entirely when empty
@@ -167,40 +165,8 @@ class EmailNotifier:
             HTML string suitable for email clients.
         """
         now = datetime.now().strftime('%Y-%m-%d %H:%M EAT')
-        total = len(analysis_results)
-
-        # Count signals
-        bullish = sum(
-            1 for r in analysis_results.values()
-            if r and r.get('signals', {}).get('overall') == 'bullish'
-        )
-        bearish = sum(
-            1 for r in analysis_results.values()
-            if r and r.get('signals', {}).get('overall') == 'bearish'
-        )
-
-        # All stocks — signal & score (same fields/order as the dashboard's
-        # Overview table)
-        stocks = []
-        for symbol, r in sorted(analysis_results.items()):
-            if not r:
-                continue
-            latest = r.get('latest', {})
-            fund = (fundamentals_data or {}).get(symbol, {})
-            tv_label, tv_class = FundamentalAnalysis.signal_from_tech_rating(
-                fund.get('tech_rating')
-            )
-            stocks.append({
-                'symbol': symbol,
-                'price': latest.get('close'),
-                'change': r.get('daily_change_pct'),
-                'tv_label': tv_label,
-                'tv_class': tv_class,
-                'score': (scores or {}).get(symbol, {}).get('overall'),
-                'score_coverage': (scores or {}).get(symbol, {}).get('coverage'),
-                'score_factors': (scores or {}).get(symbol, {}).get('factors_present'),
-                'score_factors_total': (scores or {}).get(symbol, {}).get('factors_total'),
-            })
+        candidates = candidates or []
+        track_record = track_record or {}
 
         dashboard_button = ""
         if dashboard_url:
@@ -296,108 +262,66 @@ class EmailNotifier:
 <body>
     <div class="container">
     <div class="header">
-        <h1>🇰🇪 NSE Daily Market Report</h1>
+        <h1>🎯 What to Buy Today</h1>
         <p class="meta">{now}</p>{dashboard_button}
     </div>
 
     <div class="card"><div class="bar"></div>
-    <div class="stats">
-        <div class="stat">
-            <div class="big">{total}</div>
-            <div class="label">Stocks</div>
-        </div>
-        <div class="stat">
-            <div class="big bullish">{bullish}</div>
-            <div class="label">Bullish</div>
-        </div>
-        <div class="stat">
-            <div class="big bearish">{bearish}</div>
-            <div class="label">Bearish</div>
-        </div>
-        <div class="stat">
-            <div class="big">{len(sector_data) if sector_data else 0}</div>
-            <div class="label">Sectors</div>
-        </div>
-    </div>
-    </div>
+    <h2>Today's Buy &amp; Strong Buy Candidates</h2>
 """
-        # Market breadth
-        if breadth:
+        if candidates:
             html += """
-    <div class="card"><div class="bar"></div>
-    <h2>Market Breadth</h2>
-    <div class="stats">
-"""
-            for key, label in [
-                ('pct_above_sma50', 'Above SMA50'),
-                ('pct_bullish_macd', 'Bullish MACD'),
-                ('pct_rsi_above_50', 'RSI > 50'),
-            ]:
-                if key in breadth:
-                    html += f"""
-        <div class="stat">
-            <div class="big">{breadth[key]}%</div>
-            <div class="label">{label}</div>
-        </div>"""
-            html += "\n    </div>\n    </div>\n"
-
-        # Strong Buy/Strong Sell calls only — everything else (Buy, Sell,
-        # Neutral, N/A) is dropped from the email as not conviction-worthy;
-        # the full list with every stock is still on the dashboard.
-        actionable_stocks = [
-            s for s in stocks
-            if s['tv_class'] in ('strong_buy', 'strong_sell')
-        ]
-        if actionable_stocks:
-            html += """
-    <div class="card"><div class="bar"></div>
-    <h2>📋 Strong Buy &amp; Strong Sell Signals</h2>
     <table>
-        <tr><th>Symbol</th><th>TV Signal</th><th>Price</th><th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th></tr>
+        <tr><th>Symbol</th><th>Signal</th><th>Price</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th></tr>
 """
-            for s in actionable_stocks:
-                price_str = f"{s['price']:.2f}" if s['price'] is not None else '—'
-                chg = s['change']
-                chg_cls = 'bullish' if (chg or 0) >= 0 else 'bearish'
-                chg_str = f"{chg:+.2f}%" if chg is not None else '—'
-                sc = s['score']
+            for c in candidates:
+                price_str = f"{c['price']:.2f}" if c.get('price') is not None else '—'
+                sc = c.get('score')
                 if sc is None:
                     score_html = '—'
                 else:
                     sc_cls = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
-                    coverage = s.get('score_coverage')
+                    coverage = c.get('score_coverage')
                     partial = coverage is not None and coverage < 60
                     cls = f'score {sc_cls} partial' if partial else f'score {sc_cls}'
                     flag = ' <span class="score-flag">△</span>' if partial else ''
-                    title = (f' title="Based on {s.get("score_factors")}/{s.get("score_factors_total")} factors"'
-                             if partial else '')
-                    score_html = f'<span class="{cls}"{title}>{sc}{flag}</span>'
+                    score_html = f'<span class="{cls}">{sc}{flag}</span>'
                 html += (
-                    f'        <tr><td><strong>{s["symbol"]}</strong></td>'
-                    f'<td><span class="badge {s["tv_class"]}">{s["tv_label"]}</span></td>'
+                    f'        <tr><td><strong>{c["symbol"]}</strong></td>'
+                    f'<td><span class="badge {c["tv_class"]}">{c["tv_label"]}</span></td>'
                     f'<td>{price_str}</td>'
-                    f'<td class="{chg_cls}">{chg_str}</td>'
                     f'<td>{score_html}</td></tr>\n'
                 )
-            html += "    </table>\n    </div>\n"
+            html += "    </table>\n"
+        else:
+            html += '    <p style="font-size:0.85rem; color:#667085; margin:0;">No Buy or Strong Buy signals today.</p>\n'
 
-        # Sector performance
-        if sector_data:
-            html += """
-    <div class="card"><div class="bar"></div>
-    <h2>Sector Performance</h2>
-    <table>
-        <tr><th>Sector</th><th>Stocks</th><th>Avg Change</th><th>Bullish %</th></tr>
+        # Track record — always shown, even when thin, rather than hiding
+        # an unproven or low-sample-size call behind a confident number.
+        tiers = track_record.get('tiers', {})
+        sb, by = tiers.get('strong_buy', {}), tiers.get('buy', {})
+        horizon = track_record.get('horizon_days', 10)
+
+        def _tier_line(label, t):
+            n = t.get('n', 0)
+            if not n:
+                return f"{label}: no scored calls yet"
+            hr = f"{t['hit_rate']:.0f}%" if t.get('hit_rate') is not None else '—'
+            ar = f"{t['avg_return_pct']:+.1f}%" if t.get('avg_return_pct') is not None else '—'
+            return f"{label}: {n} call(s), {hr} hit rate, {ar} avg return"
+
+        html += f"""
+    <p style="font-size:0.72rem; color:#98a2b3; margin:12px 0 0;">
+        Track record ({horizon}-trading-day forward return) &mdash;
+        {_tier_line('Strong Buy', sb)}; {_tier_line('Buy', by)}.
+        {track_record.get('note', '')}
+    </p>
+    <p style="font-size:0.78rem; margin:10px 0 0;">
+        Have a budget in mind? Get an exact buy list at
+        <a href="https://portfolio.getkitters.com/recommend">portfolio.getkitters.com</a>.
+    </p>
+    </div>
 """
-            for name, data in sector_data.items():
-                cls = "bullish" if data['avg_change_pct'] >= 0 else "bearish"
-                html += (
-                    f'        <tr><td><strong>{name}</strong></td>'
-                    f'<td>{data["count"]}</td>'
-                    f'<td class="{cls}">{data["avg_change_pct"]:+.2f}%</td>'
-                    f'<td>{data["bullish_ratio"]}%</td></tr>\n'
-                )
-            html += "    </table>\n    </div>\n"
 
         # Bonds CBK currently has open for primary-market auction (buy directly
         # from the government via DhowCSD -- a different market from the NSE

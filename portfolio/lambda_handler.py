@@ -243,6 +243,22 @@ def _fetch_prices():
         return {}
 
 
+def _fetch_recommendations():
+    """
+    Fetch the analyzer Lambda's ranked candidate list + track record,
+    published as a small public recommendations.json -- same
+    cross-Lambda pattern as _fetch_prices() (public HTTPS, not direct S3
+    access, so this Lambda needs no new IAM grant and stays on the
+    zero-third-party-dependency zip deploy). See src/recommender.py and
+    src/track_record.py for how the analyzer builds this.
+    """
+    try:
+        with urlopen(os.environ['RECOMMENDATIONS_URL'], timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return {}
+
+
 # ---- FIFO cost-basis accounting ----
 
 def _fifo_positions(trades, prices):
@@ -332,6 +348,69 @@ def _fifo_positions(trades, prices):
     return positions, totals
 
 
+# ---- Budget allocation ("given this budget, buy exactly this") ----
+
+DEFAULT_TOP_N = 5
+
+
+def _allocate_budget(candidates, budget_kes, top_n=DEFAULT_TOP_N):
+    """
+    Split budget_kes equal-weight, whole shares only, across up to top_n
+    of the already-ranked `candidates` (best-first -- see
+    src/recommender.py, which decides what counts as buy-worthy; this
+    function only ever does arithmetic against that ranking, it never
+    re-derives it).
+
+    If a candidate can't afford even 1 share at the current equal-weight
+    target, it's dropped and replaced with the next-ranked candidate not
+    yet tried, and the split is recomputed -- repeated until stable or
+    the candidate list is exhausted. Bounded to len(candidates) passes,
+    so this always terminates.
+
+    Returns (allocations, leftover_kes). allocations is a list of
+    {symbol, shares, price, allocated_kes, tv_label, score}, best-first.
+    """
+    selected = list(candidates[:top_n])
+    tried = {c['symbol'] for c in selected}
+    next_idx = top_n
+
+    for _ in range(len(candidates) + 1):
+        if not selected:
+            break
+        target = budget_kes / len(selected)
+        affordable = [c for c in selected if c['price'] <= target]
+        if len(affordable) == len(selected):
+            break  # every current pick fits the current split -- stable
+        selected = affordable
+        while len(selected) < top_n and next_idx < len(candidates):
+            candidate = candidates[next_idx]
+            next_idx += 1
+            if candidate['symbol'] not in tried:
+                selected.append(candidate)
+                tried.add(candidate['symbol'])
+
+    allocations = []
+    if selected:
+        target = budget_kes / len(selected)
+        for c in selected:
+            shares = int(target // c['price'])
+            if shares <= 0:
+                continue
+            allocations.append({
+                'symbol': c['symbol'],
+                'shares': shares,
+                'price': c['price'],
+                'allocated_kes': round(shares * c['price'], 2),
+                'tv_label': c.get('tv_label'),
+                'tv_class': c.get('tv_class'),
+                'score': c.get('score'),
+            })
+
+    spent = sum(a['allocated_kes'] for a in allocations)
+    leftover_kes = round(budget_kes - spent, 2)
+    return allocations, leftover_kes
+
+
 # ---- HTML (hand-written f-strings, matching src/email_notifier.py's style -- no templating engine) ----
 
 _CSS = """
@@ -348,6 +427,10 @@ h2 { font-size:1rem; font-weight:800; margin:0 0 14px; }
 .stat .big { font-size:1.25rem; font-weight:800; }
 .stat .label { font-size:0.66rem; color:#667085; text-transform:uppercase; font-weight:700; margin-top:2px; }
 .bullish { color:#12b981; } .bearish { color:#ef4444; } .dividend { color:#0ea5e9; } .fee { color:#f59e0b; }
+.badge { display:inline-block; padding:3px 9px; border-radius:999px; font-size:0.72rem; font-weight:800; color:#fff; }
+.badge.strong_buy { background-color:#16a34a; } .badge.buy { background-color:#65a30d; }
+.note { font-size:0.78rem; color:#667085; margin:0 0 4px; }
+.track-stats { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
 table { width:100%; border-collapse:collapse; font-size:0.85rem; }
 th, td { padding:8px 10px; text-align:left; border-bottom:1px solid rgba(148,163,184,0.28); }
 th { background-color:#f5f7fb; color:#667085; font-size:0.66rem; text-transform:uppercase; font-weight:800; }
@@ -479,7 +562,8 @@ def _render_dashboard(positions, totals, trades):
     body = f"""
     <div class="header">
       <a class="logout" href="/logout">Log out</a>
-      <a class="logout" href="/change-password" style="right:90px;">Change password</a>
+      <a class="logout" href="/change-password" style="right:150px;">Change password</a>
+      <a class="logout" href="/recommend" style="right:260px;">What should I buy?</a>
       <h1>📈 My Portfolio</h1>
     </div>
 
@@ -524,6 +608,98 @@ def _render_dashboard(positions, totals, trades):
       <tbody>{trade_rows}</tbody></table>
     </div>"""
     return _page("My Portfolio", body)
+
+
+def _render_track_record_panel(track_record):
+    """
+    Shown on both /recommend pages, always -- the whole point is that a
+    thin or empty track record is never hidden behind a confident-looking
+    number. See src/track_record.py for how n/hit_rate/avg_return_pct and
+    the note are computed.
+    """
+    track_record = track_record or {}
+    tiers = track_record.get('tiers', {})
+    stats_html = ''
+    for tier, label in (('strong_buy', 'Strong Buy'), ('buy', 'Buy')):
+        t = tiers.get(tier, {})
+        n = t.get('n', 0)
+        hit_rate = f"{t['hit_rate']:.0f}%" if t.get('hit_rate') is not None else '—'
+        avg_ret = f"{t['avg_return_pct']:+.1f}%" if t.get('avg_return_pct') is not None else '—'
+        stats_html += f"""
+        <div class="stat"><div class="big">{n}</div><div class="label">{_esc(label)} calls scored</div></div>
+        <div class="stat"><div class="big">{hit_rate}</div><div class="label">{_esc(label)} hit rate</div></div>
+        <div class="stat"><div class="big">{avg_ret}</div><div class="label">{_esc(label)} avg return</div></div>"""
+    horizon = track_record.get('horizon_days', '—')
+    note = track_record.get('note', 'No track record available.')
+    return f"""
+    <div class="card">
+      <h2>Track record</h2>
+      <p class="note">Forward return measured {_esc(str(horizon))} trading days after each call. {_esc(note)}</p>
+      <div class="track-stats">{stats_html}</div>
+    </div>"""
+
+
+def _render_recommend_form(track_record, error=None):
+    error_html = f'<p class="error">{_esc(error)}</p>' if error else ''
+    body = f"""
+    <div class="header">
+      <a class="logout" href="/">&larr; Portfolio</a>
+      <h1>🎯 What should I buy?</h1>
+    </div>
+    {_render_track_record_panel(track_record)}
+    <div class="card">
+      {error_html}
+      <p class="note">Enter a budget and get an exact, ranked buy list from today's Buy / Strong Buy candidates.</p>
+      <form method="POST" action="/recommend">
+        <p><label>Budget (KES)</label><input type="number" step="any" min="1" name="budget" required autofocus style="width:160px;"></p>
+        <p><button type="submit">Get buy list</button></p>
+      </form>
+    </div>"""
+    return _page("What should I buy? — Portfolio", body)
+
+
+def _render_recommend_result(allocations, leftover_kes, budget_kes, track_record, rec_date):
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows = ''
+    for a in allocations:
+        score_str = a['score'] if a['score'] is not None else '—'
+        badge_cls = _esc(a.get('tv_class') or 'buy')
+        rows += (
+            f'<tr><td><strong>{_esc(a["symbol"])}</strong></td>'
+            f'<td><span class="badge {badge_cls}">{_esc(a["tv_label"] or "—")}</span></td>'
+            f'<td>{score_str}</td>'
+            f'<td>{a["shares"]:,g}</td>'
+            f'<td>{a["price"]:,.2f}</td>'
+            f'<td>{a["allocated_kes"]:,.2f}</td>'
+            f'<td><form class="inline" method="POST" action="/trades">'
+            f'<input type="hidden" name="symbol" value="{_esc(a["symbol"])}">'
+            f'<input type="hidden" name="side" value="buy">'
+            f'<input type="hidden" name="quantity" value="{a["shares"]}">'
+            f'<input type="hidden" name="price" value="{a["price"]}">'
+            f'<input type="hidden" name="date" value="{today}">'
+            f'<button type="submit">Log this trade</button></form></td></tr>'
+        )
+    if not rows:
+        rows = '<tr><td colspan="7">No candidate was affordable at this budget.</td></tr>'
+
+    date_note = f" (based on {_esc(rec_date)}'s signals)" if rec_date else ''
+    body = f"""
+    <div class="header">
+      <a class="logout" href="/">&larr; Portfolio</a>
+      <h1>🎯 Buy {budget_kes:,.0f} KES{date_note}</h1>
+    </div>
+    {_render_track_record_panel(track_record)}
+    <div class="card">
+      <h2>Recommended buy list</h2>
+      <table><thead><tr><th>Symbol</th><th>Signal</th><th>Score</th><th>Shares</th>
+      <th>Price</th><th>Allocated</th><th></th></tr></thead>
+      <tbody>{rows}</tbody></table>
+      <p class="note" style="margin-top:10px;">Leftover cash (rounding to whole shares): {leftover_kes:,.2f} KES</p>
+    </div>
+    <div class="card">
+      <a href="/recommend">&larr; Try a different budget</a>
+    </div>"""
+    return _page("Buy list — Portfolio", body)
 
 
 # ---- Lambda-Function-URL (payload format v2.0) plumbing ----
@@ -646,6 +822,28 @@ def _route(event):
         prices = _fetch_prices()
         positions, totals = _fifo_positions(trades, prices)
         return _html_response(_render_dashboard(positions, totals, trades))
+
+    if path == "/recommend" and method == "GET":
+        data = _fetch_recommendations()
+        return _html_response(_render_recommend_form(data.get('track_record')))
+
+    if path == "/recommend" and method == "POST":
+        form = _parse_form(event)
+        data = _fetch_recommendations()
+        try:
+            budget = float(form.get('budget', [''])[0])
+            if budget <= 0:
+                raise ValueError("budget must be positive")
+        except (ValueError, IndexError):
+            return _html_response(
+                _render_recommend_form(data.get('track_record'), error="Enter a valid budget."),
+                status=400,
+            )
+        candidates = data.get('candidates') or []
+        allocations, leftover_kes = _allocate_budget(candidates, budget)
+        return _html_response(_render_recommend_result(
+            allocations, leftover_kes, budget, data.get('track_record'), data.get('date'),
+        ))
 
     if path == "/trades" and method == "POST":
         form = _parse_form(event)

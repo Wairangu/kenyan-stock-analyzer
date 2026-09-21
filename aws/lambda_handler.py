@@ -122,6 +122,32 @@ def _upload_prices(fundamentals_data, bucket, logger):
     return len(prices)
 
 
+def _upload_recommendations(candidates, track_record, bucket, logger):
+    """
+    Publish the ranked candidate list + track record (already computed
+    once, earlier in handler() -- see the signal_history/track_record
+    block above, which also generate_email_body() uses) as a small
+    public recommendations.json -- same pattern as _upload_prices, read
+    cross-Lambda by the portfolio app's /recommend feature over HTTPS
+    rather than direct S3 access.
+    """
+    payload = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "candidates": candidates,
+        "track_record": track_record,
+    }
+    boto3.client('s3').put_object(
+        Bucket=bucket, Key="recommendations.json",
+        Body=json.dumps(payload).encode(), ContentType="application/json",
+    )
+    n_scored = sum(t.get('n', 0) for t in track_record.get('tiers', {}).values())
+    logger.info(
+        f"  Uploaded s3://{bucket}/recommendations.json "
+        f"({len(candidates)} candidates, track record n={n_scored})"
+    )
+    return payload
+
+
 def _send_email(subject, html_body, logger):
     ses = boto3.client('ses')
     resp = ses.send_email(
@@ -274,6 +300,59 @@ def handler(event, context):
         except Exception as e:
             logger.warning(f"Scoring skipped: {e}")
 
+    candidates = []
+    try:
+        from recommender import build_candidate_list
+        candidates = build_candidate_list(analysis_results, fundamentals_data, scores)
+        logger.info(f"Recommender: {len(candidates)} buy-worthy candidate(s) today")
+    except Exception as e:
+        logger.warning(f"Candidate ranking skipped: {e}")
+
+    # Persist today's signal (so future days can be scored against it) and
+    # recompute the track record from everything persisted so far -- done
+    # here, once, so both the email and recommendations.json use the exact
+    # same numbers. No S3 to read/write in a dry run, so the track record
+    # is just correctly empty then (see track_record.compute_track_record).
+    track_record = {"horizon_days": 10, "as_of": None, "tiers": {}, "note": "No signal history yet."}
+    # Track Record page: the literal tv_class signal above, but at several
+    # horizons and all five tiers (not just strong_buy/buy) so the page can
+    # show the full bullish-to-bearish spread; plus a *different*, older
+    # signal (analysis_engine's own bullish/bearish "Overall" call) mined
+    # from ~7 weeks of already-archived market_summary_*.html reports --
+    # see src/report_archive.py for why: it's a real, immediately usable
+    # sample while the tv_class history above is still brand new.
+    TRACK_RECORD_HORIZONS = (5, 10, 20)
+    track_record_new = {}
+    track_record_legacy = {}
+    if not dry_run:
+        try:
+            import signal_history
+            from track_record import compute_track_record
+            s3_history = boto3.client('s3')
+            bucket_for_history = os.environ['S3_BUCKET']
+            signal_history.write_daily_snapshot(
+                s3_history, bucket_for_history, analysis_results, fundamentals_data, scores,
+            )
+            snapshots = signal_history.load_all_snapshots(s3_history, bucket_for_history)
+            track_record = compute_track_record(snapshots)
+
+            import report_archive
+            legacy_snapshots = report_archive.fetch_market_summary_snapshots(
+                s3_history, bucket_for_history,
+            )
+            for h in TRACK_RECORD_HORIZONS:
+                track_record_new[h] = compute_track_record(
+                    snapshots, tier_field='tv_class',
+                    tiers=('strong_buy', 'buy', 'neutral', 'sell', 'strong_sell'),
+                    horizon_days=h,
+                )
+                track_record_legacy[h] = compute_track_record(
+                    legacy_snapshots, tier_field='overall',
+                    tiers=('bullish', 'bearish'), horizon_days=h,
+                )
+        except Exception as e:
+            logger.warning(f"Signal history/track record skipped: {e}")
+
     logger.info("Generating market summary...")
     report_gen.generate_market_summary(
         analysis_results, sector_data=sector_data, breadth=breadth, report_type='html',
@@ -285,14 +364,14 @@ def handler(event, context):
         report_files={}, fundamentals_data=fundamentals_data,
         validations=validations, scores=scores, alerts=alerts, usd_kes=usd_kes,
         bonds=bonds, cbk_auctions=cbk_auctions,
+        track_record_legacy=track_record_legacy, track_record_new=track_record_new,
     )
 
     notifier = EmailNotifier(config)  # only generate_email_body() is used — SMTP fields are unused here
     dashboard_url = os.environ.get('DASHBOARD_URL')  # set by Terraform to the S3 website endpoint
     email_body = notifier.generate_email_body(
-        analysis_results, sector_data, breadth, dashboard_url=dashboard_url,
-        fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
-        cbk_auctions=cbk_auctions,
+        dashboard_url=dashboard_url, candidates=candidates, track_record=track_record,
+        bonds=bonds, cbk_auctions=cbk_auctions,
     )
     subject = f"NSE Daily Report — {datetime.now():%Y-%m-%d}"
 
@@ -306,11 +385,17 @@ def handler(event, context):
         logger.info("DRY_RUN=true — skipping S3 upload and SES send.")
         result["would_upload"] = sorted(os.listdir(config.report_directory))
         result["email_subject"] = subject
+        result["recommendations_preview"] = {"candidates": candidates, "track_record": track_record}
     else:
         bucket = os.environ['S3_BUCKET']
         logger.info(f"Uploading dashboard to s3://{bucket} ...")
         result["uploaded"] = _upload_reports(config.report_directory, bucket, logger)
         result["prices_symbols"] = _upload_prices(fundamentals_data, bucket, logger)
+
+        try:
+            _upload_recommendations(candidates, track_record, bucket, logger)
+        except Exception as e:
+            logger.warning(f"Recommendations publish skipped: {e}")
 
         distribution_id = os.environ.get('CLOUDFRONT_DISTRIBUTION_ID')
         if distribution_id:

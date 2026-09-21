@@ -302,11 +302,20 @@ def main():
             logger.info("Sending email...")
             try:
                 from email_notifier import EmailNotifier
+                from recommender import build_candidate_list
                 notifier = EmailNotifier(config)
+                candidates = build_candidate_list(analysis_results, fundamentals_data, scores)
+                # Local runs have no persisted S3 signal history (that's the
+                # deployed Lambda's job -- see aws/lambda_handler.py), so
+                # there's honestly nothing to show here yet.
+                track_record = {
+                    "horizon_days": 10, "as_of": None, "tiers": {},
+                    "note": "Track record isn't available from a local run "
+                            "-- see the deployed dashboard.",
+                }
                 body = notifier.generate_email_body(
-                    analysis_results, sector_data, breadth,
-                    fundamentals_data=fundamentals_data, scores=scores, bonds=bonds,
-                    cbk_auctions=cbk_auctions,
+                    candidates=candidates, track_record=track_record,
+                    bonds=bonds, cbk_auctions=cbk_auctions,
                 )
                 notifier.send_report(
                     f"NSE Daily Report — {analysis_date.strftime('%Y-%m-%d')}",

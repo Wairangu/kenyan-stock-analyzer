@@ -250,23 +250,34 @@ class TestEmailNotifier(unittest.TestCase):
         config = Config()
         notifier = EmailNotifier(config)
 
-        engine = AnalysisEngine()
-        data_dict = {
-            'SCOM': make_sample_data(60, seed=1),
-            'EQTY': make_sample_data(60, seed=2),
-        }
-        results = engine.analyze_multiple_stocks(data_dict)
-        breadth = engine.calculate_market_breadth(results)
+        # No fundamentals -> no tv_class -> build_candidate_list correctly
+        # excludes both (see src/recommender.py); this exercises the
+        # "no signals today" branch of the write-up.
+        candidates = []
+        track_record = {"horizon_days": 10, "as_of": None, "tiers": {}, "note": "No signal history yet."}
 
-        from sector_analysis import SectorAnalyzer
-        sa = SectorAnalyzer()
-        sectors = sa.analyze_sectors(data_dict, results)
-
-        body = notifier.generate_email_body(results, sectors, breadth)
+        body = notifier.generate_email_body(candidates=candidates, track_record=track_record)
         self.assertIsInstance(body, str)
+        self.assertIn('What to Buy Today', body)
+        self.assertIn('No Buy or Strong Buy signals today', body)
+
+    def test_email_body_with_candidates(self):
+        from email_notifier import EmailNotifier
+        config = Config()
+        notifier = EmailNotifier(config)
+
+        candidates = [
+            {'symbol': 'SCOM', 'price': 36.4, 'tv_label': 'Strong Buy',
+             'tv_class': 'strong_buy', 'score': 72, 'score_coverage': 83},
+        ]
+        track_record = {"horizon_days": 10, "as_of": "2026-09-21",
+                        "tiers": {"strong_buy": {"n": 5, "hit_rate": 80.0, "avg_return_pct": 3.2},
+                                  "buy": {"n": 0, "hit_rate": None, "avg_return_pct": None}},
+                        "note": "Only 5 scored call(s) so far."}
+
+        body = notifier.generate_email_body(candidates=candidates, track_record=track_record)
         self.assertIn('SCOM', body)
-        self.assertIn('EQTY', body)
-        self.assertIn('NSE Daily Market Report', body)
+        self.assertIn('Strong Buy', body)
 
 
 def run_tests():

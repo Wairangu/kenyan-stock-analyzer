@@ -950,7 +950,8 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
     def generate_index(self, analysis_results, sector_data=None, breadth=None,
                        report_files=None, fundamentals_data=None,
                        validations=None, scores=None, alerts=None, usd_kes=None,
-                       bonds=None, cbk_auctions=None):
+                       bonds=None, cbk_auctions=None, track_record_legacy=None,
+                       track_record_new=None):
         """
         Generate the main index.html dashboard — the single entry point.
 
@@ -1065,7 +1066,8 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
             breadth=breadth, sector_chart=sector_chart, bullish=bullish,
             bearish=bearish, neutral=neutral, total=len(stocks),
             data_date=data_date, alerts=alerts, usd_kes=usd_kes, bonds=bonds,
-            cbk_auctions=cbk_auctions,
+            cbk_auctions=cbk_auctions, track_record_legacy=track_record_legacy,
+            track_record_new=track_record_new,
         )
         return index_path
 
@@ -1081,6 +1083,7 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
         ('foreign.html', '🌍 Foreign Flows'),
         ('pulse.html', '🧭 Market Pulse'),
         ('quality.html', '✅ Data Quality'),
+        ('track_record.html', '🎯 Track Record'),
     ]
 
     def _dashboard_css(self):
@@ -2295,10 +2298,98 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
                 'These are heuristics, not rules — every situation has exceptions.</p>'
                 f'<div class="explain-grid">{items}</div></div>')
 
+    def _build_track_record_body(self, track_record_legacy=None, track_record_new=None):
+        """
+        Build the Track Record page: did the system's past calls actually
+        work? Two different signals are measured, each against its own
+        same-period market-average benchmark (see src/track_record.py) --
+        a tier that's merely tracking a rising market isn't evidence of
+        skill, so the benchmark row is shown right alongside it, not
+        buried in a footnote.
+
+        track_record_legacy / track_record_new: each {horizon_days:
+        {as_of, tiers, benchmark, note}}, keyed by the horizons computed
+        in aws/lambda_handler.py (see src/report_archive.py for the
+        legacy signal's source, src/signal_history.py for the new one).
+        None (e.g. a local run with no S3 archive to read) renders a
+        plain "not available" note instead of an empty page.
+        """
+        def _fmt_pct(v):
+            return f"{v:+.2f}%" if v is not None else '—'
+
+        def _fmt_hit(v):
+            return f"{v:.0f}%" if v is not None else '—'
+
+        def _one_table(result):
+            benchmark = result.get('benchmark') or {}
+            rows = (
+                '<tr><td><span class="badge neutral">Market avg</span></td>'
+                f'<td>{benchmark.get("n", 0)}</td><td>—</td>'
+                f'<td>{_fmt_pct(benchmark.get("avg_return_pct"))}</td></tr>'
+            )
+            for tier, t in (result.get('tiers') or {}).items():
+                rows += (
+                    f'<tr><td><span class="badge {tier}">{tier.replace("_", " ").title()}</span></td>'
+                    f'<td>{t.get("n", 0)}</td><td>{_fmt_hit(t.get("hit_rate"))}</td>'
+                    f'<td>{_fmt_pct(t.get("avg_return_pct"))}</td></tr>'
+                )
+            return (
+                f'<div class="table-wrap"><table><thead><tr>'
+                f'<th>Tier</th><th>Sample (stock-calls)</th><th>Hit rate</th><th>Avg return</th>'
+                f'</tr></thead><tbody>{rows}</tbody></table></div>'
+                f'<p class="dq-note">{_esc(result.get("note", ""))}</p>'
+            )
+
+        def _signal_section(title, description, by_horizon, since):
+            if not by_horizon:
+                return (
+                    f'<div class="section"><h2>{title}</h2>'
+                    f'<p class="page-intro">{description}</p>'
+                    '<p class="dq-note">Not available on this run.</p></div>'
+                )
+            horizon_html = ''
+            for h in sorted(by_horizon.keys()):
+                horizon_html += (
+                    f'<h3 style="font-size:0.85rem; margin:14px 0 8px;">{h} trading days later</h3>'
+                    + _one_table(by_horizon[h])
+                )
+            return (
+                f'<div class="section"><h2>{title}</h2>'
+                f'<p class="page-intro">{description} Measured since {_esc(since)}.</p>'
+                f'{horizon_html}</div>'
+            )
+
+        legacy_section = _signal_section(
+            '📈 Technical Signal — Bullish / Bearish',
+            "The system's own technical call (RSI, moving-average crossover, MACD, trend), "
+            "computed locally rather than pulled from TradingView. Mined from the daily "
+            "dashboard archive, so this has a real multi-week sample already.",
+            track_record_legacy or {},
+            '2026-07-30',
+        )
+        new_section = _signal_section(
+            '🎯 Literal Signal — Strong Buy / Buy / Neutral / Sell / Strong Sell',
+            "TradingView's own live technical-rating tag — the same one shown in the daily "
+            "email and the recommender's budget feature. Its history only started being saved "
+            "recently, so this will be thin for a while by design (see the note under each table).",
+            track_record_new or {},
+            '2026-09-21',
+        )
+
+        return (
+            '<p class="page-intro">Does the system\'s Buy/Strong Buy signal actually make '
+            "money? Every tier below is shown next to the market average over the exact same "
+            "stocks and dates — a tier that's just tracking a rising market isn't evidence of "
+            'skill, so that comparison is never hidden. This is a mechanical screen, not '
+            'investment advice.</p>'
+            + legacy_section + new_section
+        )
+
     def _build_dashboard_pages(self, stocks, gainers, losers, sectors, breadth,
                                sector_chart, bullish, bearish, neutral, total,
                                data_date=None, alerts=None, usd_kes=None, bonds=None,
-                               cbk_auctions=None):
+                               cbk_auctions=None, track_record_legacy=None,
+                               track_record_new=None):
         """
         Build the multi-page dashboard: a clean Overview plus grouped detail
         pages (Technicals, Fundamentals, Dividends, Sectors, Data Quality).
@@ -2705,6 +2796,9 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             )
         )
 
+        # ---- TRACK RECORD page (did past calls actually work?) ----
+        track_record_body = self._build_track_record_body(track_record_legacy, track_record_new)
+
         # ---- Assemble & write all pages ----
         pages = {
             'index.html': self._page_shell('NSE Dashboard — Overview', 'index.html', subtitle, overview_body, with_filter=True),
@@ -2717,6 +2811,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             'foreign.html': self._page_shell('NSE — Foreign Flows', 'foreign.html', subtitle, foreign_body),
             'pulse.html': self._page_shell('NSE — Market Pulse', 'pulse.html', subtitle, pulse_body),
             'quality.html': self._page_shell('NSE — Data Quality', 'quality.html', subtitle, quality_body),
+            'track_record.html': self._page_shell('NSE — Track Record', 'track_record.html', subtitle, track_record_body),
         }
         for filename, html in pages.items():
             with open(os.path.join(self.output_dir, filename), 'w', encoding='utf-8') as f:

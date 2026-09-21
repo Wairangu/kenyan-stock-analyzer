@@ -42,8 +42,12 @@ resource "aws_s3_bucket_policy" "reports_cloudfront_oac" {
   })
 }
 
-# The bucket is overwritten daily; expire old dated filenames
-# (market_summary_<timestamp>.html) so they don't accumulate forever.
+# Dated filenames (market_summary_<timestamp>.html) accumulate one object
+# per run and would otherwise grow forever; expire them after 90 days.
+# Scoped to that prefix specifically (not the whole bucket) so it never
+# catches history/<date>.json -- those are the system's own track record
+# and must be kept indefinitely, not just for 90 days, for the accuracy
+# validation in src/track_record.py to mean anything over time.
 resource "aws_s3_bucket_lifecycle_configuration" "reports" {
   bucket = aws_s3_bucket.reports.id
 
@@ -51,7 +55,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "reports" {
     id     = "expire-old-reports"
     status = "Enabled"
 
-    filter {}
+    filter {
+      prefix = "market_summary_"
+    }
 
     expiration {
       days = 90
