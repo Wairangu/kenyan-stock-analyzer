@@ -1,23 +1,8 @@
 """
-Dividend calendar & validation.
+Dividend declarations from a secondary calendar, separate from annual metrics.
 
-The dividend figures TradingView reports for NSE stocks are unreliable
-(wrong amounts, currency artifacts for cross-listed names like Bank of
-Kigali). This module uses an authoritative, human-curated NSE dividend
-calendar — live.mystocks.co.ke/m/calendar — as the source of record for
-declared dividends (amount in KES, book-closure and payment dates), and
-cross-checks TradingView.
-
-Rules (never guess or invent a value):
-  - If a stock has a declared dividend on the mystocks calendar, that is the
-    value shown (with its dates), tagged source='mystocks'.
-  - TradingView is used only to cross-check; a large disagreement is flagged.
-  - If a stock is NOT on the calendar (no recent declared NSE dividend, or a
-    foreign-listed name like BKG), the dividend is reported as unavailable —
-    we show nothing rather than a questionable number.
-
-Fails safe: if the calendar is unreachable, dividend_status becomes
-'unverified' and the pipeline is unaffected.
+A declaration is an instalment, not a full-year total. Annual DPS and yield
+remain provider estimates and are never replaced by a single calendar event.
 """
 
 import os
@@ -145,13 +130,11 @@ class DividendCalendar:
 
     def validate(self, symbol, tv_dps, tolerance_pct=15.0):
         """
-        Cross-check TradingView's DPS against the authoritative calendar.
+        Return an individual declaration, never compare it to annual DPS.
 
         Returns dict:
             amount, type, book_closure, payment_date, source, status, note
-        status: 'verified'  (on calendar; TradingView agrees or absent)
-                'mismatch'   (on calendar; TradingView differs materially)
-                'unavailable'(not on the NSE calendar → no number shown)
+        status: 'declaration_only' or 'unavailable'. Annual DPS is not validated.
         """
         cal = self.fetch()
         row = cal.get(symbol.upper()) if cal else None
@@ -164,87 +147,36 @@ class DividendCalendar:
                 "note": "No declared dividend on the NSE calendar",
             }
 
-        status, note = "verified", f"Declared dividend per {SOURCE}"
-        if tv_dps and row["amount"] and row["amount"] > 0:
-            diff = abs(tv_dps - row["amount"]) / row["amount"] * 100
-            if diff > tolerance_pct:
-                status = "mismatch"
-                note = (f"TradingView DPS {tv_dps:g} differs from the declared "
-                        f"KES {row['amount']:g} — showing the declared value")
+        status, note = "declaration_only", f"Single declaration per {SOURCE}; annual DPS is not verified"
         return {**row, "status": status, "note": note}
 
 
 def apply_dividend_calendar(fundamentals_data, cache_dir="data", logger=None):
-    """
-    Replace TradingView dividend figures with the authoritative NSE calendar
-    values (cross-checked). Mutates fundamentals_data in place.
+    """Attach individual declarations without changing annual DPS/yield.
 
-    For each stock:
-      - verified/mismatch: dps_fy, dividend_ex_date (book closure) and
-        dividend_yield are set from the declared dividend (yield recomputed
-        from the declared amount so the figures are consistent and backed).
-      - unavailable: dividend fields are cleared to None (shown as "n/a"),
-        never a guessed number.
-    Adds dividend_status / dividend_note / dividend_payment_date / _source.
-
-    Returns (verified, mismatch, unavailable) counts. Fails safe.
+    A calendar can omit earlier instalments. It cannot verify a full-year
+    total, and book closure is not the ex-dividend date.
     """
     counts = {"verified": 0, "corrected": 0, "unverified": 0, "none": 0}
     try:
         dc = DividendCalendar(cache_dir=cache_dir)
-        dc.fetch()
-    except Exception as e:
+        declarations = dc.fetch()
+    except Exception as exc:
+        declarations = {}
         if logger:
-            logger.warning(f"Dividend validation skipped: {e}")
-        return counts
+            logger.warning(f"Dividend calendar unavailable: {exc}")
 
-    for sym, f in (fundamentals_data or {}).items():
-        if not f:
-            continue
-        tv_dps = f.get("dps_fy")  # TradingView's figure (used as fallback)
-        res = dc.validate(sym, tv_dps)
-        f["dividend_type"] = res.get("type")
-        f["dividend_book_closure"] = res.get("book_closure")
-        f["dividend_payment_date"] = res.get("payment_date")
-
-        if res["status"] in ("verified", "mismatch") and res["amount"]:
-            # Cross-checked against the NSE calendar → use the declared value.
-            f["dps_fy"] = res["amount"]
-            f["dividend_ex_date"] = res.get("book_closure") or None
-            f["dividend_ex_date_is_upcoming"] = None  # book closure, not TV ex-date
-            close = f.get("close")
-            f["dividend_yield"] = (
-                round(res["amount"] / close * 100, 2) if close else None
-            )
-            f["dividend_source"] = res["source"]
-            f["dividend_note"] = res["note"]
-            status = "corrected" if res["status"] == "mismatch" else "verified"
-        elif tv_dps and tv_dps > 0:
-            # Not on the calendar → fall back to TradingView, clearly flagged
-            # as unverified (keep TradingView's dps / yield / ex-date as-is).
-            f["dividend_source"] = "TradingView (unverified)"
-            f["dividend_note"] = ("From TradingView — could not be cross-checked "
-                                  "on the NSE dividend calendar; treat with caution")
-            status = "unverified"
-        else:
-            # No dividend on record from any source.
-            f["dps_fy"] = 0
-            f["dividend_yield"] = None
-            f["dividend_ex_date"] = None
-            f["dividend_source"] = None
-            f["dividend_note"] = "No dividend on record"
-            status = "none"
-
-        f["dividend_status"] = status
-        counts[status] += 1
-
-    if logger:
-        logger.info(
-            f"  Dividends: {counts['verified']} verified, "
-            f"{counts['corrected']} corrected (calendar vs TradingView), "
-            f"{counts['unverified']} TradingView-only (uncross-checked), "
-            f"{counts['none']} none"
-        )
+    for symbol, fund in (fundamentals_data or {}).items():
+        row = declarations.get(symbol.upper())
+        fund["dividend_source"] = "TradingView (annual, unverified)"
+        fund["dividend_status"] = "unverified"
+        fund["dividend_note"] = "Annual DPS/yield from TradingView; calendar declarations are separate instalments."
+        fund["declared_dividend"] = row.get("amount") if row else None
+        fund["dividend_type"] = row.get("type") if row else None
+        fund["dividend_book_closure"] = row.get("book_closure") if row else None
+        fund["dividend_payment_date"] = row.get("payment_date") if row else None
+        fund["declared_dividend_source"] = row.get("source") if row else None
+        counts["unverified"] += 1
     return counts
 
 

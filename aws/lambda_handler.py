@@ -110,7 +110,8 @@ def _upload_prices(fundamentals_data, bucket, logger):
     needing their own TradingView/tvkit dependency.
     """
     prices = {
-        sym: {"price": d.get("close"), "change_pct": d.get("change_pct")}
+        sym: {"price": d.get("close"), "change_pct": d.get("change_pct"),
+              "sector": d.get("sector"), "date": d.get("_data_date")}
         for sym, d in (fundamentals_data or {}).items()
         if d.get("close") is not None
     }
@@ -131,8 +132,13 @@ def _upload_recommendations(candidates, track_record, bucket, logger):
     cross-Lambda by the portfolio app's /recommend feature over HTTPS
     rather than direct S3 access.
     """
+    from data_quality import latest_completed_session, recommendation_expiry
+    from recommender import STRATEGY_VERSION
+    session = latest_completed_session().isoformat()
     payload = {
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": session,
+        "valid_until": recommendation_expiry(session),
+        "strategy_version": STRATEGY_VERSION,
         "candidates": candidates,
         "track_record": track_record,
     }
@@ -302,8 +308,8 @@ def handler(event, context):
 
     candidates = []
     try:
-        from recommender import build_candidate_list
-        candidates = build_candidate_list(analysis_results, fundamentals_data, scores)
+        from recommender import screen_with_alerts
+        candidates = screen_with_alerts(analysis_results, fundamentals_data, scores, validations, alerts)
         logger.info(f"Recommender: {len(candidates)} buy-worthy candidate(s) today")
     except Exception as e:
         logger.warning(f"Candidate ranking skipped: {e}")
@@ -332,6 +338,7 @@ def handler(event, context):
             bucket_for_history = os.environ['S3_BUCKET']
             signal_history.write_daily_snapshot(
                 s3_history, bucket_for_history, analysis_results, fundamentals_data, scores,
+                candidates=candidates, validations=validations,
             )
             snapshots = signal_history.load_all_snapshots(s3_history, bucket_for_history)
             track_record = compute_track_record(snapshots)
@@ -349,6 +356,7 @@ def handler(event, context):
                 track_record_legacy[h] = compute_track_record(
                     legacy_snapshots, tier_field='overall',
                     tiers=('bullish', 'bearish'), horizon_days=h,
+                    selected_only=False,
                 )
         except Exception as e:
             logger.warning(f"Signal history/track record skipped: {e}")

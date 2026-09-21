@@ -54,8 +54,7 @@ class Config:
         self.price_disagree_threshold_pct = float(
             os.getenv('PRICE_DISAGREE_THRESHOLD_PCT', '1.0')
         )
-        # Anchor displayed prices to the NSE official close (settled after
-        # market close), using TradingView only as a cross-check.
+        # Attach an independent quote without replacing the price series.
         self.enable_official_close = (
             os.getenv('ENABLE_OFFICIAL_CLOSE', 'true').lower() == 'true'
         )

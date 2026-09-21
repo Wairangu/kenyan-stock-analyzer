@@ -1,8 +1,8 @@
 # 🇰🇪 Kenyan Stock Analyzer — NSE Daily Dashboard
 
-A fully automated daily stock analysis pipeline for the **Nairobi Securities Exchange (NSE)**. Displays the **NSE official closing price** for each stock (settled after market close), cross-checked against **TradingView**, and uses TradingView for fundamentals and price history. Performs technical and fundamental analysis on all 57+ listed stocks and generates an interactive HTML dashboard with individual stock reports.
+A daily stock screening pipeline for the **Nairobi Securities Exchange (NSE)**. Prices and indicators use the same historical series, with dated quotes independently cross-checked against AFX. TradingView supplies fundamentals and primary price history. The pipeline generates dashboards, screened candidates and a reference portfolio; its scores are uncalibrated rules, not forecasts or probabilities of profit.
 
-> **Accuracy note:** prices shown are the official NSE close from an independent NSE data service, cross-checked against TradingView; where the two disagree (usually thinly-traded stocks) the price is flagged ❗ so you know to confirm it. No free feed is guaranteed accurate to the shilling intraday — for the most reliable numbers, run **after market close (15:00 EAT)**.
+> **Accuracy:** run after **15:30 EAT**. Missing, stale, disputed or undated quotes cannot qualify for a buy list. A third-party quote is not a guarantee of an official close. Report alerts explain rejected candidates. Read [the screening and evaluation methodology](docs/strategy.md) before using the results.
 
 ## Features
 
@@ -207,7 +207,7 @@ kenyan_stock_analyzer/
 
 ## Data Sources
 
-All fundamental and technical data is sourced from **TradingView** via the `tvkit` library. Nothing is guessed or estimated.
+Primary fundamental and technical data comes from **TradingView** via `tvkit`. The PDF fallback uses heuristic OCR and is report-only; Yahoo data must verify the Kenyan exchange and KES currency. Individual dividend declarations are kept separate from annual dividend estimates.
 
 | Data Type | Source | Method |
 |-----------|--------|--------|

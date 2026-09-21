@@ -128,10 +128,7 @@ def main():
         logger.info("Analyzing...")
         analysis_results = analysis_engine.analyze_multiple_stocks(stock_data)
 
-        # ---- Anchor prices to the NSE official close + cross-check ----
-        # Displayed prices/changes use the official settled close (stable after
-        # market close); TradingView is kept only as a cross-check. Done before
-        # sector/breadth so those use the official figures too.
+        # ---- Cross-check prices without altering the indicator inputs ----
         validations = {}
         if config.enable_price_validation or config.enable_official_close:
             try:
@@ -142,7 +139,7 @@ def main():
                 )
                 reference = pv.fetch_reference_prices()
                 if config.enable_price_validation:
-                    logger.info("Cross-checking TradingView vs NSE official close...")
+                    logger.info("Cross-checking historical prices against the independent board...")
                     for symbol, result in analysis_results.items():
                         if not result:
                             continue
@@ -230,6 +227,23 @@ def main():
             except Exception as e:
                 logger.warning(f"Scoring skipped: {e}")
 
+        from recommender import screen_with_alerts
+        candidates = screen_with_alerts(analysis_results, fundamentals_data, scores, validations, alerts)
+        track_record = {"tiers": {}, "note": "No version-2 decision history yet."}
+        track_record_new = {}
+        if config.enable_history:
+            try:
+                from signal_history import write_local_snapshot, load_local_snapshots
+                from track_record import compute_track_record
+                history_dir = os.path.join(config.cache_dir, 'history')
+                write_local_snapshot(history_dir, analysis_results, fundamentals_data, scores,
+                                     candidates=candidates, validations=validations)
+                snapshots = load_local_snapshots(history_dir)
+                track_record_new = {h: compute_track_record(snapshots, horizon_days=h) for h in (5, 10, 20)}
+                track_record = track_record_new[10]
+            except Exception as e:
+                logger.warning(f"Model snapshot/track record skipped: {e}")
+
         # ---- Persist daily history snapshot ----
         if config.enable_history:
             try:
@@ -295,6 +309,7 @@ def main():
             usd_kes=usd_kes,
             bonds=bonds,
             cbk_auctions=cbk_auctions,
+            track_record_new=track_record_new,
         )
 
         # ---- Email ----
@@ -302,17 +317,7 @@ def main():
             logger.info("Sending email...")
             try:
                 from email_notifier import EmailNotifier
-                from recommender import build_candidate_list
                 notifier = EmailNotifier(config)
-                candidates = build_candidate_list(analysis_results, fundamentals_data, scores)
-                # Local runs have no persisted S3 signal history (that's the
-                # deployed Lambda's job -- see aws/lambda_handler.py), so
-                # there's honestly nothing to show here yet.
-                track_record = {
-                    "horizon_days": 10, "as_of": None, "tiers": {},
-                    "note": "Track record isn't available from a local run "
-                            "-- see the deployed dashboard.",
-                }
                 body = notifier.generate_email_body(
                     candidates=candidates, track_record=track_record,
                     bonds=bonds, cbk_auctions=cbk_auctions,

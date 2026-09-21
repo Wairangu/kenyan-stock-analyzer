@@ -2322,11 +2322,16 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
 
         def _one_table(result):
             benchmark = result.get('benchmark') or {}
+            model = result.get('portfolio') or {}
             rows = (
-                '<tr><td><span class="badge neutral">Market avg</span></td>'
+                '<tr><td><span class="badge neutral">Equal-weight comparison</span></td>'
                 f'<td>{benchmark.get("n", 0)}</td><td>—</td>'
                 f'<td>{_fmt_pct(benchmark.get("avg_return_pct"))}</td></tr>'
             )
+            if result.get('selected_only'):
+                rows += (f'<tr><td>Model portfolio (after assumed costs)</td><td>{model.get("n", 0)} periods</td>'
+                         f'<td>{_fmt_hit(model.get("hit_rate"))}</td>'
+                         f'<td>{_fmt_pct(model.get("avg_return_pct"))}</td></tr>')
             for tier, t in (result.get('tiers') or {}).items():
                 rows += (
                     f'<tr><td><span class="badge {tier}">{tier.replace("_", " ").title()}</span></td>'
@@ -2368,20 +2373,19 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             '2026-07-30',
         )
         new_section = _signal_section(
-            '🎯 Literal Signal — Strong Buy / Buy / Neutral / Sell / Strong Sell',
-            "TradingView's own live technical-rating tag — the same one shown in the daily "
-            "email and the recommender's budget feature. Its history only started being saved "
-            "recently, so this will be thin for a while by design (see the note under each table).",
+            '🎯 Screened model portfolio',
+            "A KES 100,000 model account using recorded selections, whole shares and concentration limits. "
+            "Entry is the next session's close. Unallocated funds stay in cash. "
+            "Only version-2 decisions are eligible; older signals cannot establish this portfolio's performance.",
             track_record_new or {},
             '2026-09-21',
         )
 
         return (
-            '<p class="page-intro">Does the system\'s Buy/Strong Buy signal actually make '
-            "money? Every tier below is shown next to the market average over the exact same "
-            "stocks and dates — a tier that's just tracking a rising market isn't evidence of "
-            'skill, so that comparison is never hidden. This is a mechanical screen, not '
-            'investment advice.</p>'
+            '<p class="page-intro">Prospective model results and separate historical signal diagnostics. '
+            'These are price returns, excluding dividends and corporate actions. The benchmark is an '
+            'equal-weight investable universe on matching dates, not an NSE index. '
+            'A small sample cannot establish predictive skill.</p>'
             + legacy_section + new_section
         )
 
@@ -2400,7 +2404,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
         data_date_str = data_date or datetime.now().strftime('%Y-%m-%d')
         fx = f" · 💵 USD/KES {usd_kes['rate']:.2f}" if (usd_kes and usd_kes.get('rate')) else ""
         subtitle = (f"{now} · {total} stocks · 📅 {data_date_str} · "
-                    f"Prices: NSE official close · Fundamentals: TradingView{fx}")
+                    f"Prices: historical feed, independently cross-checked · Fundamentals: TradingView{fx}")
 
         pv_marker = {
             'ok': ('✓', '#16a34a', 'Verified against independent source'),
@@ -2432,9 +2436,9 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             c = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
             coverage = s.get('score_coverage')
             fp, ft = s.get('score_factors'), s.get('score_factors_total')
-            # Below 60% weight-coverage, the score leans on too few factors
+            # Below 80% weight-coverage, the score leans on too few factors
             # to trust at face value -- flag it rather than show a clean number.
-            partial = coverage is not None and coverage < 60
+            partial = coverage is not None and coverage < 80
             cls = f'score {c} partial' if partial else f'score {c}'
             title = (f' title="Based on {fp}/{ft} factors ({coverage}% of factor weight had data)"'
                      if fp is not None else '')
@@ -2490,7 +2494,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             + search_bar +
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
             '<th>Symbol</th><th title="TradingView Buy/Sell rating">TV Signal</th><th>Price</th>'
-            '<th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
+            '<th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th>'
             f'</tr></thead><tbody>{ov_rows}</tbody></table></div></div>')
 
         # ---- TECHNICALS page ----
@@ -2553,7 +2557,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             '<th title="Earnings per share">EPS</th><th title="Return on Equity">ROE</th>'
             '<th title="Net profit margin">Net Margin</th><th title="Debt / Equity">D/E</th>'
             '<th title="Revenue growth vs last year">Rev Growth</th><th>Yield</th>'
-            '<th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
+            '<th title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th>'
             f'</tr></thead><tbody>{fund_rows}</tbody></table></div></div>'
             + self._fundamentals_explainer())
 
@@ -2690,8 +2694,8 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             items = ', '.join(
                 f"{m['symbol']} ({(m.get('validation') or {}).get('pct_diff'):+.1f}%)"
                 for m in mismatch_list)
-            mismatch_note = (f'<div class="dq-note dq-mismatch">⚠️ TradingView differs from the NSE '
-                             f'official close for: {items}</div>')
+            mismatch_note = (f'<div class="dq-note dq-mismatch">⚠️ Historical feed differs from the '
+                             f'independent quote for: {items}</div>')
         alerts_cards = ''
         for sym in sorted((alerts or {}).keys()):
             items = alerts[sym]
@@ -2707,8 +2711,9 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             f'<div class="stat-card"><div class="stat-value bearish">{v_mismatch}</div><div class="stat-label">Price mismatch</div></div>'
             f'<div class="stat-card"><div class="stat-value neutral">{v_stale}</div><div class="stat-label">Stale / thin</div></div>'
             f'<div class="stat-card"><div class="stat-value">{v_unverified}</div><div class="stat-label">Unverified</div></div></div>'
-            '<div class="dq-note">Prices shown are the <strong>NSE official close</strong> (afx.kwayisi.org), '
-            'cross-checked against TradingView. ✓ = TradingView confirms it · ❗ = differs · 🕒 = last traded &gt;1 day ago.</div>'
+            '<div class="dq-note">Prices and indicators use the same historical series, cross-checked against afx.kwayisi.org. '
+            '✓ = dated quotes agree · ❗ = differs · 🕒 = not traded in the latest completed NSE session. '
+            'Unverified, disputed and stale prices are excluded from buy candidates.</div>'
             f'{mismatch_note}</div>{alerts_section}')
 
         # ---- NEXT EARNINGS page ----
@@ -2771,7 +2776,7 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
             '<th>Symbol</th><th>Earnings Date</th><th>When</th>'
             '<th>Price</th><th>Change</th><th>TV Signal</th>'
-            '<th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th>'
+            '<th title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th>'
             f'</tr></thead><tbody>{earnings_rows}</tbody></table></div>'
             f'<div class="dq-note">{len(earnings_rows_raw)} stock(s) with an upcoming '
             'earnings release. Earnings dates are only published for a subset of NSE stocks; '

@@ -13,10 +13,11 @@ high sustainable yield, illiquid, price-source mismatch) for the dashboard.
 """
 
 from logger import get_logger
+from data_quality import finite_number
 
 logger = get_logger(__name__)
 
-# Default factor weights (must sum to 1.0). Tunable via Config.
+# Baseline policy weights, not fitted return forecasts or probabilities.
 # Value, quality and liquidity each gave up a little weight to make room
 # for growth, a standard factor that was previously missing entirely.
 DEFAULT_WEIGHTS = {
@@ -57,7 +58,7 @@ def _score_value(fund, sector_medians=None):
 
     pe = fund.get("pe_ratio")
     if pe and pe > 0:
-        s = _relative_to_sector(pe, med.get("pe_ratio"))
+        s = _relative_to_sector(pe, med.get("pe_ratio") if med.get("pe_ratio_count", 0) >= 3 else None)
         if s is not None:
             parts.append(s)
             reasons.append(f"P/E {pe:.1f} (vs sector)")
@@ -66,7 +67,7 @@ def _score_value(fund, sector_medians=None):
             reasons.append(f"P/E {pe:.1f}")
     pb = fund.get("price_to_book")
     if pb and pb > 0:
-        s = _relative_to_sector(pb, med.get("price_to_book"))
+        s = _relative_to_sector(pb, med.get("price_to_book") if med.get("price_to_book_count", 0) >= 3 else None)
         if s is not None:
             parts.append(s)
             reasons.append(f"P/B {pb:.2f} (vs sector)")
@@ -91,6 +92,14 @@ def _score_quality(fund):
     if roe is not None:
         parts.append(_clamp(roe * 4))  # roe 25% -> 100
         reasons.append(f"ROE {roe:.1f}%")
+    if fund.get("sector") in ("Finance", "Banking", "Insurance"):
+        # Deposits and regulatory liquidity are not industrial working capital.
+        roa = fund.get("roa")
+        if roa is not None:
+            parts.append(_clamp(roa * 50))
+            reasons.append(f"ROA {roa:.1f}%")
+        reasons.append("financial firm: leverage/current ratio excluded; loan quality and regulatory capital need review")
+        return (round(sum(parts) / len(parts)) if parts else None), reasons
     nm = fund.get("net_margin")
     if nm is not None:
         parts.append(_clamp(nm * 3.3))  # ~30% -> 100
@@ -142,13 +151,8 @@ def _score_momentum(analysis_result, fund):
 
     rsi = latest.get("rsi")
     if rsi is not None:
-        # Reward healthy uptrend (50-65); penalise overbought/oversold extremes
-        if rsi > 70:
-            parts.append(35)
-        elif rsi < 30:
-            parts.append(45)  # oversold: possible bounce, not strong momentum
-        else:
-            parts.append(_clamp(50 + (rsi - 50) * 2))
+        # Continuous momentum score; no discontinuity at RSI 30 or 70.
+        parts.append(_clamp(rsi))
         reasons.append(f"RSI {rsi:.0f}")
 
     perf = fund.get("perf_3m")
@@ -163,35 +167,29 @@ def _score_momentum(analysis_result, fund):
 
 def _score_dividend(fund):
     """Reward yield, but only if the payout looks sustainable."""
-    parts, reasons = [], []
     dy = fund.get("dividend_yield")
-    if dy is not None:
-        parts.append(_clamp(dy * 12.5))  # 8% -> 100
-        reasons.append(f"yield {dy:.1f}%")
     payout = fund.get("dividend_payout_ratio")
-    if payout is not None and payout > 0:
-        # 40-70% is healthy; >100% is unsustainable
-        if payout > 100:
-            parts.append(20)
-        elif payout > 80:
-            parts.append(55)
-        else:
-            parts.append(85)
-        reasons.append(f"payout {payout:.0f}%")
-    if not parts:
-        return None, ["no dividend"]
-    return round(sum(parts) / len(parts)), reasons
+    if dy is None or dy < 0:
+        return None, ["no annual dividend yield"]
+    if dy == 0:
+        return 0, ["no annual dividend"]
+    if payout is None:
+        return None, ["dividend sustainability unknown: payout missing"]
+    if payout <= 0 or payout > 100:
+        return 0, [f"yield {dy:.1f}%; payout {payout:.0f}% is not covered by earnings"]
+    return round(_clamp(dy * 12.5)), [f"annual yield {dy:.1f}%; payout {payout:.0f}%"]
 
 
 def _score_liquidity(fund):
     """Higher traded value = easier to enter/exit. KES value traded per day."""
-    vt = fund.get("value_traded")
-    if vt is None or vt <= 0:
+    vt = fund.get("median_value_traded_20d")
+    if vt is None or vt < 0:
         return None, ["no liquidity data"]
-    # 100M KES/day -> ~100; 1M -> ~30
+    if vt == 0:
+        return 0, ["zero median traded value over 20 sessions"]
     import math
     s = _clamp((math.log10(vt) - 6) * 33)  # 1e6 ->0, 1e9 ->99
-    return round(s), [f"traded KES {vt/1e6:.1f}M"]
+    return round(s), [f"20-session median traded KES {vt/1e6:.1f}M"]
 
 
 def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None):
@@ -209,7 +207,13 @@ def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None
     fall back to the fixed anchor automatically.
     """
     weights = weights or DEFAULT_WEIGHTS
-    fund = fund or {}
+    fund = dict(fund or {})
+    numeric_fields = ("pe_ratio", "price_to_book", "peg_ratio", "roe", "roa",
+                      "net_margin", "debt_to_equity", "current_ratio", "eps_growth_yoy",
+                      "revenue_growth_yoy", "perf_3m", "dividend_yield", "dividend_payout_ratio")
+    for key in numeric_fields:
+        fund[key] = finite_number(fund.get(key))
+    fund['median_value_traded_20d'] = finite_number((analysis_result or {}).get('median_value_traded_20d'))
 
     subs = {
         "value": _score_value(fund, sector_medians),
@@ -280,9 +284,9 @@ def generate_alerts(symbol, analysis_result, fund, validation=None):
     # Strong technical signal
     tr = fund.get("tech_rating")
     if tr is not None:
-        if tr >= 0.5:
+        if tr > 0.5:
             alerts.append("⭐ TradingView: Strong Buy signal")
-        elif tr <= -0.5:
+        elif tr < -0.5:
             alerts.append("⚠️ TradingView: Strong Sell signal")
 
     # Fresh MACD cross
@@ -294,7 +298,7 @@ def generate_alerts(symbol, analysis_result, fund, validation=None):
     # High sustainable dividend yield
     dy = fund.get("dividend_yield")
     payout = fund.get("dividend_payout_ratio")
-    if dy and dy >= 8 and (payout is None or payout <= 100):
+    if dy and dy >= 8 and payout is not None and 0 < payout <= 100:
         alerts.append(f"💰 High dividend yield ({dy:.1f}%)")
 
     # Upcoming dividend ex-date

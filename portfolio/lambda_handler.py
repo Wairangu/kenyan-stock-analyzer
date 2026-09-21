@@ -48,6 +48,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import re
 import uuid
@@ -329,6 +330,7 @@ def _fifo_positions(trades, prices):
                 'cost_basis': round(cost_basis, 2),
                 'current_price': current_price,
                 'market_value': round(market_value, 2) if market_value is not None else None,
+                'sector': (prices.get(symbol) or {}).get('sector') or 'Unknown',
                 'unrealized_gain': round(unrealized_gain, 2) if unrealized_gain is not None else None,
                 'unrealized_pct': round(unrealized_pct, 2) if unrealized_pct is not None else None,
                 'realized_gain': round(realized_gain, 2),
@@ -353,62 +355,13 @@ def _fifo_positions(trades, prices):
 DEFAULT_TOP_N = 5
 
 
-def _allocate_budget(candidates, budget_kes, top_n=DEFAULT_TOP_N):
-    """
-    Split budget_kes equal-weight, whole shares only, across up to top_n
-    of the already-ranked `candidates` (best-first -- see
-    src/recommender.py, which decides what counts as buy-worthy; this
-    function only ever does arithmetic against that ranking, it never
-    re-derives it).
-
-    If a candidate can't afford even 1 share at the current equal-weight
-    target, it's dropped and replaced with the next-ranked candidate not
-    yet tried, and the split is recomputed -- repeated until stable or
-    the candidate list is exhausted. Bounded to len(candidates) passes,
-    so this always terminates.
-
-    Returns (allocations, leftover_kes). allocations is a list of
-    {symbol, shares, price, allocated_kes, tv_label, score}, best-first.
-    """
-    selected = list(candidates[:top_n])
-    tried = {c['symbol'] for c in selected}
-    next_idx = top_n
-
-    for _ in range(len(candidates) + 1):
-        if not selected:
-            break
-        target = budget_kes / len(selected)
-        affordable = [c for c in selected if c['price'] <= target]
-        if len(affordable) == len(selected):
-            break  # every current pick fits the current split -- stable
-        selected = affordable
-        while len(selected) < top_n and next_idx < len(candidates):
-            candidate = candidates[next_idx]
-            next_idx += 1
-            if candidate['symbol'] not in tried:
-                selected.append(candidate)
-                tried.add(candidate['symbol'])
-
-    allocations = []
-    if selected:
-        target = budget_kes / len(selected)
-        for c in selected:
-            shares = int(target // c['price'])
-            if shares <= 0:
-                continue
-            allocations.append({
-                'symbol': c['symbol'],
-                'shares': shares,
-                'price': c['price'],
-                'allocated_kes': round(shares * c['price'], 2),
-                'tv_label': c.get('tv_label'),
-                'tv_class': c.get('tv_class'),
-                'score': c.get('score'),
-            })
-
-    spent = sum(a['allocated_kes'] for a in allocations)
-    leftover_kes = round(budget_kes - spent, 2)
-    return allocations, leftover_kes
+def _allocate_budget(candidates, budget_kes, top_n=DEFAULT_TOP_N, holdings=None):
+    try:
+        from .allocation import allocate_budget
+    except ImportError:  # standalone Lambda zip
+        from allocation import allocate_budget
+    return allocate_budget(candidates, budget_kes, top_n, holdings=holdings,
+                           fee_pct=TRANSACTION_FEE_PCT)
 
 
 # ---- HTML (hand-written f-strings, matching src/email_notifier.py's style -- no templating engine) ----
@@ -620,6 +573,11 @@ def _render_track_record_panel(track_record):
     track_record = track_record or {}
     tiers = track_record.get('tiers', {})
     stats_html = ''
+    model = track_record.get('portfolio', {})
+    avg = model.get('avg_return_pct')
+    model_avg = f'{avg:+.2f}%' if avg is not None else '—'
+    stats_html += (f'<div class="stat"><div class="big">{model_avg}</div>'
+                   f'<div class="label">Model portfolio average ({model.get("n", 0)} periods)</div></div>')
     for tier, label in (('strong_buy', 'Strong Buy'), ('buy', 'Buy')):
         t = tiers.get(tier, {})
         n = t.get('n', 0)
@@ -649,7 +607,7 @@ def _render_recommend_form(track_record, error=None):
     {_render_track_record_panel(track_record)}
     <div class="card">
       {error_html}
-      <p class="note">Enter a budget and get an exact, ranked buy list from today's Buy / Strong Buy candidates.</p>
+      <p class="note">Enter a budget for a screened buy list. Estimated fees are included; existing holdings count toward 20% stock and 40% sector limits. Unallocated money stays in cash.</p>
       <form method="POST" action="/recommend">
         <p><label>Budget (KES)</label><input type="number" step="any" min="1" name="budget" required autofocus style="width:160px;"></p>
         <p><button type="submit">Get buy list</button></p>
@@ -670,7 +628,7 @@ def _render_recommend_result(allocations, leftover_kes, budget_kes, track_record
             f'<td>{score_str}</td>'
             f'<td>{a["shares"]:,g}</td>'
             f'<td>{a["price"]:,.2f}</td>'
-            f'<td>{a["allocated_kes"]:,.2f}</td>'
+            f'<td>{a["cash_required_kes"]:,.2f} (fees {a["fees_kes"]:,.2f})</td>'
             f'<td><form class="inline" method="POST" action="/trades">'
             f'<input type="hidden" name="symbol" value="{_esc(a["symbol"])}">'
             f'<input type="hidden" name="side" value="buy">'
@@ -692,9 +650,9 @@ def _render_recommend_result(allocations, leftover_kes, budget_kes, track_record
     <div class="card">
       <h2>Recommended buy list</h2>
       <table><thead><tr><th>Symbol</th><th>Signal</th><th>Score</th><th>Shares</th>
-      <th>Price</th><th>Allocated</th><th></th></tr></thead>
+        <th>Price</th><th>Cost including fees</th><th></th></tr></thead>
       <tbody>{rows}</tbody></table>
-      <p class="note" style="margin-top:10px;">Leftover cash (rounding to whole shares): {leftover_kes:,.2f} KES</p>
+      <p class="note" style="margin-top:10px;">Unallocated cash after estimated fees, whole shares and concentration limits: {leftover_kes:,.2f} KES. Quotes are indicative; confirm execution prices with your broker.</p>
     </div>
     <div class="card">
       <a href="/recommend">&larr; Try a different budget</a>
@@ -832,7 +790,7 @@ def _route(event):
         data = _fetch_recommendations()
         try:
             budget = float(form.get('budget', [''])[0])
-            if budget <= 0:
+            if not math.isfinite(budget) or budget <= 0:
                 raise ValueError("budget must be positive")
         except (ValueError, IndexError):
             return _html_response(
@@ -840,7 +798,21 @@ def _route(event):
                 status=400,
             )
         candidates = data.get('candidates') or []
-        allocations, leftover_kes = _allocate_budget(candidates, budget)
+        try:
+            try:
+                expiry = datetime.fromisoformat(data.get('valid_until') or '')
+            except ValueError:
+                raise ValueError("Recommendations are not yet available in the current format; wait for the next report.")
+            if expiry.tzinfo is None or datetime.now(timezone.utc) >= expiry:
+                raise ValueError("Recommendations are out of date; wait for a fresh report.")
+            prices = _fetch_prices()
+            positions, _ = _fifo_positions(_load_trades(username), prices)
+            for symbol, position in positions.items():
+                if position['qty'] > 0 and (prices.get(symbol) or {}).get('date') != data.get('date'):
+                    raise ValueError(f"A current price is needed for holding {symbol}.")
+            allocations, leftover_kes = _allocate_budget(candidates, budget, holdings=positions)
+        except (ValueError, TypeError) as exc:
+            return _html_response(_render_recommend_form(data.get('track_record'), error=str(exc)), status=400)
         return _html_response(_render_recommend_result(
             allocations, leftover_kes, budget, data.get('track_record'), data.get('date'),
         ))
