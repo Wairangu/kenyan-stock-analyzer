@@ -65,14 +65,17 @@
             </div>
         </div>
         <div class="metric">
-            <div class="label">Dividend</div>
+            <div class="label">Annual dividend (provider estimate)</div>
             <div class="value" style="font-size:1rem;">
                 {% if fundamentals.dps_fy and fundamentals.dps_fy > 0 %}
                 <span style="background:#ccfbf1;color:#0f766e;font-weight:700;padding:2px 10px;border-radius:999px;">KES {{ "%g"|format(fundamentals.dps_fy) }}/share</span>
                 {% else %}
-                <span style="background:#f1f5f9;color:#94a3b8;font-weight:600;padding:2px 10px;border-radius:999px;">0 — no dividend</span>
+                <span style="background:#f1f5f9;color:#94a3b8;font-weight:600;padding:2px 10px;border-radius:999px;">{{ '0 — no dividend' if fundamentals.dps_fy == 0 else 'Unavailable' }}</span>
                 {% endif %}
                 <br>
+                {% if fundamentals.declared_dividend %}
+                <span>Latest declaration: KES {{ "%g"|format(fundamentals.declared_dividend) }}/share ({{ fundamentals.dividend_type }})</span><br>
+                {% endif %}
                 {% if fundamentals.dividend_ex_date %}
                 <span style="font-size:0.85rem;">Ex-div:
                     {% if fundamentals.dividend_ex_date_is_upcoming %}
@@ -84,7 +87,7 @@
                 {% endif %}
                 {% if fundamentals.earnings_next_date %}<br><span style="font-size:0.85rem; color:var(--text-muted);">Next earnings: {{ fundamentals.earnings_next_date }}</span>{% endif %}
             </div>
-            <div style="font-size:0.72rem; color:var(--text-muted); margin-top:6px; line-height:1.4;">A green (upcoming) ex-date means you can still buy before it to receive the declared dividend. 0 means the company currently pays no dividend.</div>
+            <div style="font-size:0.72rem; color:var(--text-muted); margin-top:6px; line-height:1.4;">Annual figures and individual declarations have different periods. Confirm dividend entitlement and dates with the issuer or broker.</div>
         </div>
         {% if fundamentals.price_52w_high or fundamentals.value_traded %}
         <div class="metric">

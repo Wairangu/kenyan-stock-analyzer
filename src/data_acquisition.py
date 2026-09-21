@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from logger import get_logger
 from utils import retry, safe_float
+from data_quality import extract_report_date
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -94,24 +95,28 @@ class DataAcquisition:
         """
         # Check cache first (for daily data)
         if not force_refresh and interval == '1d':
-            cached = self._load_from_cache(symbol)
+            cached = self._load_from_cache(symbol, period)
             if cached is not None:
                 logger.debug(f"Cache hit for {symbol}")
                 return cached
 
         # Try each source in order
+        quote_fallback = None
         for source in self.data_sources:
             logger.debug(f"Trying {source} for {symbol}")
             data = self._fetch_from_source(source, symbol, period, interval)
             if data is not None and not data.empty:
+                if len(data) == 1 and period != '1d':
+                    quote_fallback = data
+                    continue  # A daily quote cannot replace requested history.
                 # Cache the result
                 if interval == '1d':
-                    self._save_to_cache(symbol, data)
+                    self._save_to_cache(symbol, data, period)
                 return data
             logger.warning(f"  {source} failed for {symbol}")
 
         logger.error(f"All sources failed for {symbol}")
-        return None
+        return quote_fallback
 
     def fetch_multiple_stocks(self, symbols, period='1y', interval='1d',
                               force_refresh=False):
@@ -247,6 +252,9 @@ class DataAcquisition:
             logger.warning("tvkit not installed. Run: pip install tvkit")
             return None
 
+        if interval != '1d':
+            logger.warning("TradingView helper supports daily bars only")
+            return None
         tv_symbol = f"NSEKE:{symbol}"
         days = self._period_to_days(period)
 
@@ -278,6 +286,9 @@ class DataAcquisition:
             ])
         )
         df.index.name = 'Date'
+        df = df.sort_index()
+        df.attrs.update(source='TradingView', identity_verified=True,
+                        exchange='NSEKE', symbol=symbol, adjustment='provider-unspecified')
 
         logger.info(
             f"  {symbol} from TradingView: {len(df)} days, "
@@ -339,15 +350,21 @@ class DataAcquisition:
             symbol_upper = symbol.upper()
             if symbol_upper in all_stocks:
                 row = all_stocks[symbol_upper]
-                today_ts = pd.Timestamp.today().normalize()
+                report_date = row.get('date')
+                if not report_date:
+                    logger.warning(f"NSE PDF has no verifiable trading date for {symbol}")
+                    return None
                 df = pd.DataFrame({
                     'open': [row['open']],
                     'high': [row['high']],
                     'low': [row['low']],
                     'close': [row['close']],
                     'volume': [row['volume']],
-                }, index=[today_ts])
+                }, index=[pd.Timestamp(report_date)])
                 df.index.name = 'Date'
+                # OCR's heuristic column/name mapping is not reliable enough
+                # to establish an investable security's identity.
+                df.attrs.update(source='NSE PDF (OCR)', identity_verified=False)
                 logger.info(
                     f"  {symbol} from NSE PDF: close={row['close']}, "
                     f"volume={row['volume']}"
@@ -449,6 +466,9 @@ class DataAcquisition:
 
         # Parse the OCR'd text
         all_stocks = self._parse_nse_text(all_text)
+        report_date = extract_report_date(all_text[:1500]) or extract_report_date(pdf_url.rsplit('/', 1)[-1])
+        for row in all_stocks.values():
+            row['date'] = report_date.isoformat() if report_date else None
         logger.info(f"Extracted {len(all_stocks)} stocks from NSE PDF")
         return all_stocks
 
@@ -502,7 +522,7 @@ class DataAcquisition:
             'Kakuzi': 'KUKZ',
             'Unga Group': 'UNGA',
             'BOC Kenya': 'BOC',
-            'Carbacid': 'CARG',
+            'Carbacid': 'CARB',
             'Car & General': 'CARG',
             'C&G': 'CARG',
             'Nation Media': 'NMG',
@@ -605,19 +625,17 @@ class DataAcquisition:
         logger.debug(f"Fetching {yahoo_symbol} from Yahoo Finance")
 
         try:
+            ticker = yf.Ticker(yahoo_symbol)
+            info = ticker.get_info()
+            if info.get('currency') != 'KES' or info.get('exchange') not in ('NAI', 'NSEKE'):
+                logger.warning(f"Yahoo identity/currency not verified for {yahoo_symbol}")
+                return None
             data = yf.download(
                 yahoo_symbol,
                 period=period,
                 interval=interval,
-                progress=False, timeout=10,
+                progress=False, timeout=10, auto_adjust=False,
             )
-            if data.empty:
-                # Try without .NR suffix
-                logger.debug(f"  {yahoo_symbol} empty, trying {symbol}")
-                data = yf.download(
-                    symbol, period=period, interval=interval,
-                    progress=False, timeout=10,
-                )
 
             if data.empty:
                 return None
@@ -639,6 +657,9 @@ class DataAcquisition:
                 logger.warning(f"  Missing columns for {symbol}: {data.columns.tolist()}")
                 return None
             data = data[available]
+            data = data.sort_index()
+            data.attrs.update(source='Yahoo Finance', identity_verified=True,
+                              exchange=info['exchange'], symbol=symbol, adjustment='unadjusted')
             logger.info(f"  {symbol} from Yahoo: {len(data)} rows")
             return data
 
@@ -648,27 +669,27 @@ class DataAcquisition:
 
     # ---- Caching ----
 
-    def _cache_key(self, symbol):
+    def _cache_key(self, symbol, period='1y'):
         """Generate a cache key for today's date."""
         today = datetime.now().strftime('%Y%m%d')
         h = hashlib.md5(symbol.encode()).hexdigest()[:8]
-        return f"{symbol}_{today}_{h}"
+        return f"{symbol}_{today}_v2_{period}_{h}"
 
-    def _save_to_cache(self, symbol, data):
+    def _save_to_cache(self, symbol, data, period='1y'):
         """Save DataFrame to Parquet cache."""
         try:
             path = os.path.join(
-                self.cache_dir, f"{self._cache_key(symbol)}.parquet"
+                self.cache_dir, f"{self._cache_key(symbol, period)}.parquet"
             )
             data.to_parquet(path)
             logger.debug(f"  Cached {symbol} → {path}")
         except Exception as e:
             logger.debug(f"  Cache write error: {e}")
 
-    def _load_from_cache(self, symbol):
+    def _load_from_cache(self, symbol, period='1y'):
         """Load DataFrame from Parquet cache if fresh (today's data)."""
         try:
-            prefix = f"{symbol}_{datetime.now().strftime('%Y%m%d')}_"
+            prefix = self._cache_key(symbol, period)
             for fname in os.listdir(self.cache_dir):
                 if fname.startswith(prefix) and fname.endswith('.parquet'):
                     path = os.path.join(self.cache_dir, fname)

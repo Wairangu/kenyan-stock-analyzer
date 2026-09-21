@@ -104,7 +104,7 @@ def main():
         sys.exit(1)
     analysis_results = engine.analyze_multiple_stocks(stock_data)
 
-    # ---- Anchor prices to the NSE official close + cross-check ----
+    # ---- Cross-check prices without altering indicator inputs ----
     validations = {}
     if config.enable_price_validation or config.enable_official_close:
         try:
@@ -178,6 +178,9 @@ def main():
     except Exception as e:
         logger.warning(f"Scoring skipped: {e}")
 
+    from recommender import screen_with_alerts
+    candidates = screen_with_alerts(analysis_results, fundamentals_data, scores, validations, alerts)
+
     # ---- Build the summary PDF ----
     logger.info("Building summary PDF...")
     result = report_gen.generate_summary(
@@ -201,9 +204,7 @@ def main():
         return
 
     from email_notifier import EmailNotifier
-    from recommender import build_candidate_list
     notifier = EmailNotifier(config)
-    candidates = build_candidate_list(analysis_results, fundamentals_data, scores)
     # No persisted S3 signal history from this standalone script (that's the
     # deployed Lambda's job -- see aws/lambda_handler.py), so there's
     # honestly nothing to show here yet.

@@ -1,171 +1,141 @@
-"""
-Track record: did the system's past calls actually work?
+"""Prospective model-portfolio evaluation, separate from legacy signal diagnostics.
 
-Pure function over a {date: {symbol: {...}}} snapshot dict -- no
-AWS/network calls, independently testable. Works for any tiered signal
-the snapshots carry: the literal TradingView tv_class (Strong Buy/Buy/...,
-see signal_history.py) or the system's own legacy bullish/bearish
-technical call (see report_archive.py, which mines it from ~7 weeks of
-already-archived daily reports). Deliberately conservative: reports an
-explicit "not enough data yet" note below a sample-size floor rather than
-presenting a thin sample as a confident number, matching the rest of the
-codebase's transparent-screen ethos (src/scoring.py's per-factor
-`reasons`, the email's partial-coverage flag).
-
-Every tier's average return is only meaningful next to what the same
-stocks did on average over the same period -- a "Strong Buy" tier that's
-merely tracking a rising market isn't evidence of skill. compute_track_record
-always includes that same-period, all-symbols benchmark alongside the tiers.
+Version-2 records freeze the actual screened allocation. Historical tier labels
+cannot be retroactively treated as portfolios. Prices alone cannot establish
+total returns: these diagnostics explicitly exclude dividends/corporate actions.
 """
 
-from datetime import datetime, timedelta
-
-from logger import get_logger
-
-logger = get_logger(__name__)
+from datetime import timedelta
+from data_quality import finite_number, parse_date, is_session
 
 DEFAULT_TIER_FIELD = "tv_class"
 DEFAULT_TIERS = ("strong_buy", "buy")
-MIN_SAMPLES_FOR_CONFIDENCE = 20
 
 
-def _trading_days_after(dates_sorted, start_date, horizon_days):
-    """
-    Return the first date in `dates_sorted` that is >= horizon_days
-    *snapshot* days after start_date (snapshots only exist for trading
-    days already, so this counts snapshots, not calendar days). Returns
-    None if there aren't enough later snapshots yet.
-    """
-    try:
-        idx = dates_sorted.index(start_date)
-    except ValueError:
-        return None
-    target_idx = idx + horizon_days
-    if target_idx >= len(dates_sorted):
-        return None
-    return dates_sorted[target_idx]
+def _next_session(day, steps=1):
+    for _ in range(steps):
+        day += timedelta(days=1)
+        while not is_session(day):
+            day += timedelta(days=1)
+    return day.isoformat()
+
+
+def _summary(returns):
+    return {"n": len(returns),
+            "hit_rate": round(100 * sum(r > 0 for r in returns) / len(returns), 1) if returns else None,
+            "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None}
 
 
 def compute_track_record(snapshots_by_date, tier_field=DEFAULT_TIER_FIELD,
-                          tiers=DEFAULT_TIERS, horizon_days=10):
+                         tiers=DEFAULT_TIERS, horizon_days=10, *,
+                         selected_only=True, slippage_pct=0.001):
+    """Evaluate non-overlapping decisions at next-session close, after costs.
+
+    Missing execution/exit quotes invalidate the entire selected period rather
+    than selectively dropping losing/delisted constituents. Snapshot gaps do
+    not change the requested NSE-session horizon. Legacy mode is explicitly an
+    overlapping price-signal diagnostic, never presented as a portfolio.
     """
-    Args:
-        snapshots_by_date: {date: {symbol: {price, <tier_field>, ...}}}.
-        tier_field: which field in each symbol's record holds its tier,
-            e.g. "tv_class" (strong_buy/buy/neutral/sell/strong_sell) or
-            "overall" (bullish/bearish).
-        tiers: which values of tier_field to report on.
-        horizon_days: number of later trading-day snapshots ahead to
-            measure the forward return at.
-
-    Returns:
-        {horizon_days, as_of, tiers: {<tier>: {n, hit_rate, avg_return_pct}, ...},
-         benchmark: {n, avg_return_pct} (every symbol, regardless of tier,
-         over the same date/horizon pairs -- the "just held the market"
-         comparison), note}
-    """
-    dates_sorted = sorted(snapshots_by_date.keys())
-    as_of = dates_sorted[-1] if dates_sorted else datetime.now().strftime("%Y-%m-%d")
-
-    returns_by_tier = {tier: [] for tier in tiers}
-    benchmark_returns = []
-
-    for date in dates_sorted:
-        later_date = _trading_days_after(dates_sorted, date, horizon_days)
-        if later_date is None:
+    if not isinstance(horizon_days, int) or horizon_days < 1:
+        raise ValueError("horizon_days must be a positive integer")
+    slip = finite_number(slippage_pct)
+    if slip is None or not 0 <= slip < 1:
+        raise ValueError("Invalid slippage")
+    dates = sorted(d for d in snapshots_by_date if parse_date(d) and is_session(parse_date(d)))
+    returns = {tier: [] for tier in tiers}
+    benchmark = []
+    periods = []
+    missing_periods = 0
+    last_exit = None
+    for signal_date in dates:
+        if selected_only and last_exit and signal_date < last_exit:
             continue
-        today_symbols = snapshots_by_date[date]
-        later_symbols = snapshots_by_date[later_date]
-        for symbol, rec in today_symbols.items():
-            entry_price = rec.get("price")
-            exit_price = (later_symbols.get(symbol) or {}).get("price")
-            if not entry_price or not exit_price:
-                continue
-            ret = (exit_price / entry_price - 1) * 100
-            benchmark_returns.append(ret)
-            tier = rec.get(tier_field)
-            if tier in returns_by_tier:
-                returns_by_tier[tier].append(ret)
+        records = snapshots_by_date[signal_date]
+        chosen = {s: r for s, r in records.items()
+                  if (r.get("schema_version") == 2 and r.get("selected") is True)
+                  or (not selected_only and r.get(tier_field) in tiers)}
+        if not chosen:
+            continue
+        entry_date = _next_session(parse_date(signal_date))
+        exit_date = _next_session(parse_date(entry_date), horizon_days)
+        if exit_date > dates[-1]:
+            continue  # outstanding period, not a failure
+        if selected_only:
+            last_exit = exit_date  # reserve the horizon even if marks are missing
+        entries = snapshots_by_date.get(entry_date, {})
+        exits = snapshots_by_date.get(exit_date, {})
 
-    def _summarize(rets):
-        n = len(rets)
-        if n == 0:
-            return {"n": 0, "hit_rate": None, "avg_return_pct": None}
-        hits = sum(1 for r in rets if r > 0)
-        return {
-            "n": n,
-            "hit_rate": round(100 * hits / n, 1),
-            "avg_return_pct": round(sum(rets) / n, 2),
-        }
+        def quote(symbol, rows):
+            rec = rows.get(symbol, {})
+            price = finite_number(rec.get("price"))
+            expected_date = entry_date if rows is entries else exit_date
+            if selected_only and (rec.get("price_verified") is not True
+                                  or rec.get("price_date") != expected_date):
+                return None
+            return price if price is not None and price > 0 else None
 
-    tiers_out = {tier: _summarize(rets) for tier, rets in returns_by_tier.items()}
-    total_n = sum(t["n"] for t in tiers_out.values())
-    benchmark_out = {
-        "n": len(benchmark_returns),
-        "avg_return_pct": round(sum(benchmark_returns) / len(benchmark_returns), 2)
-        if benchmark_returns else None,
-    }
+        if any(quote(s, entries) is None or quote(s, exits) is None for s in chosen):
+            missing_periods += 1
+            continue
+        first = next(iter(chosen.values()))
+        budget = finite_number(first.get("model_budget_kes")) if selected_only else None
+        fee = finite_number(first.get("fee_pct", 0.015)) if selected_only else 0.0
+        if selected_only and (budget is None or budget <= 0 or fee is None or not 0 <= fee < 1):
+            missing_periods += 1
+            continue
+        cash = budget or 0.0
+        proceeds = 0.0
+        bought = []
+        pending = []
+        for symbol, rec in sorted(chosen.items(), key=lambda item: (item[1].get('allocation_rank') or 0, item[0])):
+            entry = quote(symbol, entries) * (1 + slip if selected_only else 1)
+            exit_price = quote(symbol, exits) * (1 - slip if selected_only else 1)
+            ret = (exit_price * (1 - fee) / (entry * (1 + fee)) - 1) * 100
+            if selected_only:
+                requested = finite_number(rec.get("allocation_shares"))
+                if requested is None or requested <= 0:
+                    continue
+                shares = min(int(requested), int(cash / (entry * (1 + fee))))
+                if shares <= 0:
+                    continue
+                cash -= shares * entry * (1 + fee)
+                proceeds += shares * exit_price * (1 - fee)
+                bought.append(symbol)
+            pending.append((rec.get(tier_field), ret))
+        if selected_only and not bought:
+            continue
+        for tier, ret in pending:
+            if tier in returns:
+                returns[tier].append(ret)
 
-    if not dates_sorted:
-        note = "No signal history yet — this starts counting from today."
-    elif total_n < MIN_SAMPLES_FOR_CONFIDENCE:
-        note = (
-            f"Only {total_n} scored call(s) so far (need ~{MIN_SAMPLES_FOR_CONFIDENCE}+ "
-            "for a meaningful read) — treat hit rate/avg return as provisional."
-        )
-    else:
-        note = f"Based on {total_n} scored calls."
-
-    return {
-        "horizon_days": horizon_days,
-        "as_of": as_of,
-        "tiers": tiers_out,
-        "benchmark": benchmark_out,
-        "note": note,
-    }
-
-
-# ---- Test ----
-if __name__ == "__main__":
-    from logger import setup_logging
-    setup_logging()
-
-    base = datetime(2026, 7, 31)
-    fake_snapshots = {}
-    price = 100.0
-    for i in range(15):
-        date = (base + timedelta(days=i)).strftime("%Y-%m-%d")
-        price *= 1.01  # steadily rising, so strong_buy calls should show a positive track record
-        fake_snapshots[date] = {
-            "AAA": {"price": round(price, 2), "tv_class": "strong_buy"},
-            "BBB": {"price": round(price * 0.5, 2), "tv_class": "neutral"},
-        }
-
-    result = compute_track_record(fake_snapshots, horizon_days=10)
-    print(result)
-    assert result["tiers"]["strong_buy"]["n"] >= 1
-    assert result["tiers"]["strong_buy"]["avg_return_pct"] > 0
-    assert result["benchmark"]["n"] >= 1
-    print("OK: default tv_class/strong_buy-buy")
-
-    # Legacy signal: different field name, different tiers, and here the
-    # "bearish" tier is deliberately *worse* than "bullish" -- the
-    # benchmark/tier split should make that visible rather than hiding it.
-    fake_legacy = {}
-    aaa_price, bbb_price = 100.0, 100.0
-    for i in range(15):
-        date = (base + timedelta(days=i)).strftime("%Y-%m-%d")
-        aaa_price *= 1.01  # rises
-        bbb_price *= 0.995  # falls
-        fake_legacy[date] = {
-            "AAA": {"price": round(aaa_price, 2), "overall": "bullish"},
-            "BBB": {"price": round(bbb_price, 2), "overall": "bearish"},
-        }
-    legacy_result = compute_track_record(
-        fake_legacy, tier_field="overall", tiers=("bullish", "bearish"), horizon_days=10,
-    )
-    print(legacy_result)
-    assert legacy_result["tiers"]["bullish"]["avg_return_pct"] > 0
-    assert legacy_result["tiers"]["bearish"]["avg_return_pct"] < 0
-    assert legacy_result["tiers"]["bullish"]["avg_return_pct"] > legacy_result["tiers"]["bearish"]["avg_return_pct"]
-    print("OK: generalized tier_field/tiers + benchmark")
+        universe = [s for s, r in records.items() if r.get("investable")] if selected_only else list(records)
+        # Same decision dates, entry convention and costs as the portfolio.
+        b_rets = []
+        for symbol in universe:
+            entry, end = quote(symbol, entries), quote(symbol, exits)
+            if entry is None or end is None:
+                b_rets = []
+                break
+            b_rets.append((end * (1 - slip if selected_only else 1) * (1 - fee)
+                           / (entry * (1 + slip if selected_only else 1) * (1 + fee)) - 1) * 100)
+        b_return = sum(b_rets) / len(b_rets) if b_rets else None
+        if b_return is not None:
+            benchmark.append(b_return)
+        if selected_only:
+            periods.append({"signal_date": signal_date, "entry_date": entry_date, "exit_date": exit_date,
+                            "return_pct": round((cash + proceeds) / budget * 100 - 100, 4),
+                            "benchmark_return_pct": b_return, "symbols": bought})
+    model = _summary([p["return_pct"] for p in periods])
+    model["periods"] = periods
+    model["incomplete_periods"] = missing_periods
+    mode = "Screened model portfolio" if selected_only else "Legacy signal diagnostic (overlapping observations)"
+    note = (f"{mode}. Next-session close entry; {horizon_days} NSE sessions held. "
+            + ("Includes recorded fees and assumed " + str(slip * 100) + "% slippage per side. "
+               if selected_only else "Gross price changes, excluding trading costs. ")
+            + "Price returns only: dividends and corporate actions are not available. "
+            + "Sample counts do not establish statistical confidence. "
+            + f"{missing_periods} completed period(s) excluded for missing data.")
+    return {"horizon_days": horizon_days, "as_of": dates[-1] if dates else None,
+            "tiers": {tier: _summary(values) for tier, values in returns.items()},
+            "benchmark": _summary(benchmark), "portfolio": model,
+            "selected_only": selected_only, "note": note}

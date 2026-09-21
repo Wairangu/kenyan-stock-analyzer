@@ -23,6 +23,7 @@ from datetime import datetime
 import pandas as pd
 
 from logger import get_logger
+from data_quality import finite_number, latest_completed_session, parse_date, extract_report_date
 
 logger = get_logger(__name__)
 
@@ -118,6 +119,8 @@ class PriceValidator:
         """
         strip = lambda s: re.sub(r"<[^>]+>", "", s).replace("&amp;", "&").strip()
         out = {}
+        # Only inspect the board header, not dates in company news below it.
+        board_date = extract_report_date(re.sub(r"<[^>]+>", " ", html.split('<tr>')[0]))
         for row in html.split("<tr>"):
             if "/nse/" not in row:
                 continue
@@ -142,12 +145,13 @@ class PriceValidator:
                     change = float(cells[4].replace(",", "").replace("+", ""))
                 except ValueError:
                     change = None
-            out[ticker] = {"price": price, "volume": volume, "change": change}
+            out[ticker] = {"price": price, "volume": volume, "change": change,
+                           "date": board_date.isoformat() if board_date else None}
         return out
 
     # ---- Validation ----
 
-    def validate(self, symbol, dashboard_price, history_df=None):
+    def validate(self, symbol, dashboard_price, history_df=None, as_of=None):
         """
         Validate one stock's price and assess freshness.
 
@@ -163,7 +167,10 @@ class PriceValidator:
         """
         ref = self.fetch_reference_prices()
         ref_row = ref.get(symbol.upper()) if ref else None
-        reference_price = ref_row["price"] if ref_row else None
+        reference_price = finite_number(ref_row.get("price")) if ref_row else None
+        dashboard_price = finite_number(dashboard_price)
+        expected = parse_date(as_of) if as_of is not None else latest_completed_session()
+        reference_date = parse_date(ref_row.get('date')) if ref_row else None
 
         pct_diff = None
         agree = None
@@ -191,17 +198,21 @@ class PriceValidator:
             except Exception as e:
                 logger.debug(f"Freshness calc error for {symbol}: {e}")
 
-        is_stale = bool(days_stale and days_stale > 1)
+        last_date = parse_date(last_traded_date)
+        is_stale = last_date != expected
 
         # Status precedence: unverified -> mismatch -> stale -> ok
-        if reference_price is None:
+        if reference_price is None or reference_price <= 0 or dashboard_price is None or dashboard_price <= 0:
             status = "unverified"
             note = "No independent source to compare against"
+        elif reference_date != expected:
+            status = "unverified"
+            note = "Independent quote has no matching completed-session date"
         elif agree is False:
             status = "mismatch"
             note = (
-                f"TradingView ({dashboard_price:g}) differs from the NSE "
-                f"official close ({reference_price:g}) by {pct_diff:+.1f}% "
+                f"History close ({dashboard_price:g}) differs from the independent "
+                f"quote ({reference_price:g}) by {pct_diff:+.1f}% "
                 f"— price uncertain"
             )
         elif is_stale:
@@ -214,6 +225,7 @@ class PriceValidator:
         return {
             "reference_price": reference_price,
             "reference_source": REFERENCE_SOURCE,
+            "reference_date": reference_date.isoformat() if reference_date else None,
             "pct_diff": round(pct_diff, 2) if pct_diff is not None else None,
             "agree": agree,
             "last_traded_date": last_traded_date,
@@ -226,17 +238,10 @@ class PriceValidator:
 
 def apply_official_close(analysis_results, reference, logger=None):
     """
-    Anchor each stock's DISPLAYED price and daily change to the NSE official
-    closing price (from the reference board), which after market close is a
-    stable, settled value — unlike TradingView's ~15-min-delayed feed.
+    Attach independent quotes without changing historical prices or signals.
 
-    - Sets latest['close'] to the official close.
-    - Recomputes daily_change_pct from the official day's change when available.
-    - Keeps the original TradingView close as latest['tv_close'] so the two can
-      still be cross-checked, and tags latest['price_source'].
-
-    Fails safe per stock: if there is no official price, the TradingView value
-    is left untouched. Returns the number of stocks anchored.
+    The historical public name is retained for callers. AFX is a secondary
+    board, not a guarantee of an official settled close. Returns attached count.
     """
     anchored = 0
     for sym, result in (analysis_results or {}).items():
@@ -247,18 +252,16 @@ def apply_official_close(analysis_results, reference, logger=None):
             continue
         row = (reference or {}).get(sym.upper())
         if not row or not row.get('price'):
-            latest['price_source'] = 'TradingView'
             continue
         off = row['price']
-        latest['tv_close'] = latest.get('close')
-        latest['close'] = off
-        latest['price_source'] = 'NSE official (afx)'
-        chg = row.get('change')
-        if chg is not None and (off - chg) != 0:
-            result['daily_change_pct'] = chg / (off - chg) * 100.0
+        # Keep all prices/indicators on the same historical series. A second
+        # source is corroboration, not permission to overwrite one input.
+        latest['reference_close'] = off
+        latest['reference_date'] = row.get('date')
+        latest['reference_source'] = REFERENCE_SOURCE
         anchored += 1
     if logger:
-        logger.info(f"  Anchored {anchored} prices to the NSE official close")
+        logger.info(f"  Attached {anchored} independent quotes; historical prices unchanged")
     return anchored
 
 

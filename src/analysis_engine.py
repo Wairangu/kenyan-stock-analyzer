@@ -10,6 +10,8 @@ Signals: Crossover detection (not just state), market breadth.
 
 import pandas as pd
 import numpy as np
+from datetime import timedelta
+from data_quality import is_session
 from logger import get_logger
 from utils import detect_support_resistance
 
@@ -69,7 +71,7 @@ class AnalysisEngine:
 
     @staticmethod
     def calculate_ema(data, window):
-        return data.ewm(span=window, adjust=False).mean()
+        return data.ewm(span=window, adjust=False, min_periods=window).mean()
 
     # ---- RSI with Wilder's Smoothing ----
 
@@ -91,12 +93,21 @@ class AnalysisEngine:
         gain = delta.clip(lower=0)
         loss = (-delta).clip(lower=0)
 
-        # Use EMA (Wilder's smoothing) for average gain/loss
-        avg_gain = gain.ewm(alpha=1.0 / window, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1.0 / window, adjust=False).mean()
+        # Wilder seeds with the arithmetic mean of the first window changes.
+        avg_gain = pd.Series(np.nan, index=data.index, dtype=float)
+        avg_loss = avg_gain.copy()
+        if len(data) <= window:
+            return avg_gain
+        avg_gain.iloc[window] = gain.iloc[1:window + 1].mean()
+        avg_loss.iloc[window] = loss.iloc[1:window + 1].mean()
+        for i in range(window + 1, len(data)):
+            avg_gain.iloc[i] = (avg_gain.iloc[i - 1] * (window - 1) + gain.iloc[i]) / window
+            avg_loss.iloc[i] = (avg_loss.iloc[i - 1] * (window - 1) + loss.iloc[i]) / window
 
         rs = avg_gain / avg_loss.replace(0, np.nan)
         rsi = 100.0 - (100.0 / (1.0 + rs))
+        rsi.loc[(avg_loss == 0) & (avg_gain > 0)] = 100.0
+        rsi.loc[(avg_loss == 0) & (avg_gain == 0)] = 50.0
 
         # First `window` values are unreliable, set to NaN
         rsi.iloc[:window] = np.nan
@@ -211,7 +222,7 @@ class AnalysisEngine:
         low_min = data['low'].rolling(window=k_window).min()
         high_max = data['high'].rolling(window=k_window).max()
 
-        stoch_k = 100 * ((data['close'] - low_min) / (high_max - low_min))
+        stoch_k = 100 * ((data['close'] - low_min) / (high_max - low_min).replace(0, np.nan))
         stoch_d = stoch_k.rolling(window=d_window).mean()
 
         return {'stoch_k': stoch_k, 'stoch_d': stoch_d}
@@ -244,6 +255,12 @@ class AnalysisEngine:
             return {}
 
         df = data.copy()
+        if df.index.has_duplicates or not df.index.is_monotonic_increasing:
+            logger.warning("Unordered or duplicate price history")
+            return {}
+        if not np.isfinite(df['close']).all() or (df['close'] <= 0).any():
+            logger.warning("Non-finite or non-positive closing prices")
+            return {}
 
         # ---- Calculate all indicators ----
         df['sma_20'] = self.calculate_sma(df['close'], self.sma_short)
@@ -283,6 +300,24 @@ class AnalysisEngine:
 
         # ---- Latest values ----
         latest = self._get_latest_values(df)
+        latest['price_source'] = data.attrs.get('source', 'TradingView')
+
+        recent = df.tail(20)
+        traded_value = None
+        if len(recent) == 20 and 'volume' in recent:
+            volumes = recent['volume']
+            consecutive = False
+            if isinstance(df.index, pd.DatetimeIndex):
+                day = df.index[-1].date()
+                expected = []
+                while len(expected) < 20:
+                    if is_session(day):
+                        expected.append(day)
+                    day -= timedelta(days=1)
+                consecutive = list(recent.index.date) == list(reversed(expected))
+            if consecutive and np.isfinite(volumes).all() and (volumes >= 0).all():
+                traded_value = float((recent['close'] * volumes).median())
+        history_date = df.index[-1].strftime('%Y-%m-%d') if isinstance(df.index, pd.DatetimeIndex) else None
 
         # ---- Daily change ----
         daily_change = None
@@ -299,6 +334,11 @@ class AnalysisEngine:
             'support': supports,
             'resistance': resistances,
             'daily_change_pct': daily_change,
+            'history_bars': len(df),
+            'history_date': history_date,
+            'history_complete': len(df) >= max(self.sma_long, self.macd_slow + self.macd_signal_period),
+            'median_value_traded_20d': traded_value,
+            'identity_verified': bool(data.attrs.get('identity_verified', False)),
         }
 
     def _generate_signals(self, df):
@@ -316,11 +356,13 @@ class AnalysisEngine:
                 if not pd.isna(prev['sma_20']) and not pd.isna(prev['sma_50']):
                     if prev['sma_20'] <= prev['sma_50']:
                         signals['ma_crossover'] = 'golden_cross'  # Just crossed!
-            else:
+            elif latest['sma_20'] < latest['sma_50']:
                 signals['ma_crossover'] = 'bearish'
                 if not pd.isna(prev['sma_20']) and not pd.isna(prev['sma_50']):
                     if prev['sma_20'] >= prev['sma_50']:
                         signals['ma_crossover'] = 'death_cross'  # Just crossed!
+            else:
+                signals['ma_crossover'] = 'neutral'
         else:
             signals['ma_crossover'] = 'undefined'
 
@@ -343,11 +385,13 @@ class AnalysisEngine:
                 if not pd.isna(prev['macd']) and not pd.isna(prev['macd_signal']):
                     if prev['macd'] <= prev['macd_signal']:
                         signals['macd'] = 'bullish_cross'
-            else:
+            elif latest['macd'] < latest['macd_signal']:
                 signals['macd'] = 'bearish'
                 if not pd.isna(prev['macd']) and not pd.isna(prev['macd_signal']):
                     if prev['macd'] >= prev['macd_signal']:
                         signals['macd'] = 'bearish_cross'
+            else:
+                signals['macd'] = 'neutral'
         else:
             signals['macd'] = 'undefined'
 
@@ -364,9 +408,8 @@ class AnalysisEngine:
 
         # 5. Trend
         if not pd.isna(latest['close']) and not pd.isna(latest['sma_50']):
-            signals['trend'] = (
-                'bullish' if latest['close'] > latest['sma_50'] else 'bearish'
-            )
+            signals['trend'] = ('bullish' if latest['close'] > latest['sma_50'] else
+                                'bearish' if latest['close'] < latest['sma_50'] else 'neutral')
         else:
             signals['trend'] = 'undefined'
 
@@ -404,7 +447,9 @@ class AnalysisEngine:
                 signals['ma_crossover'], signals['macd'], signals['trend']
             ] if 'bearish' in str(s) or 'death' in str(s)
         )
-        if bullish_count > bearish_count:
+        if not self._get_latest_values(df).get('sma_50'):
+            signals['overall'] = 'undefined'
+        elif bullish_count > bearish_count:
             signals['overall'] = 'bullish'
         elif bearish_count > bullish_count:
             signals['overall'] = 'bearish'

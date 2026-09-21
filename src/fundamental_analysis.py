@@ -252,6 +252,7 @@ class FundamentalAnalysis:
 
         # Extra columns not in COMPREHENSIVE_FULL that we surface in reports.
         extra_columns = [
+            'industry',
             'dividend_ex_date_upcoming', 'dividend_ex_date_recent',
             'earnings_release_next_date', 'earnings_release_date',
             'price_52_week_high', 'price_52_week_low', 'book_value_per_share_fq',
@@ -330,8 +331,10 @@ class FundamentalAnalysis:
                         "capital_expenditures_ttm": d.get('capital_expenditures_ttm'),
 
                         # === Dividends ===
-                        "dividend_yield": getattr(stock, 'dividends_yield_current', None)
-                            or d.get('dividends_yield_current') or d.get('dividends_yield'),
+                        "dividend_yield": next((v for v in (
+                            getattr(stock, 'dividends_yield_current', None),
+                            d.get('dividends_yield_current'), d.get('dividends_yield'))
+                            if v is not None), None),
                         "dividend_payout_ratio": d.get('dividend_payout_ratio_ttm'),
                         "dps_fy": d.get('dps_common_stock_prim_issue_fy'),
                         "dividend_ex_date": self._ts_to_date(
@@ -355,6 +358,7 @@ class FundamentalAnalysis:
 
                         # === Classification ===
                         "sector": getattr(stock, 'sector', None) or d.get('sector', 'Unknown'),
+                        "industry": getattr(stock, 'industry', None) or d.get('industry'),
                         "market": d.get('market', 'kenya'),
                         "currency": getattr(stock, 'currency', 'KES'),
 
@@ -707,10 +711,10 @@ class FundamentalAnalysis:
         [-1, 1]) to a Buy/Sell label and a CSS class token.
 
         Uses TradingView's own standard thresholds:
-          >=  0.5  Strong Buy
-          >=  0.1  Buy
-          > -0.1  Neutral
-          > -0.5  Sell
+          >   0.5  Strong Buy
+          >   0.1  Buy
+          >= -0.1  Neutral
+          >= -0.5  Sell
           else     Strong Sell
 
         Returns a (label, css_class) tuple. css_class is one of
@@ -723,13 +727,16 @@ class FundamentalAnalysis:
             r = float(rating)
         except (ValueError, TypeError):
             return ("N/A", "undefined")
-        if r >= 0.5:
+        import math
+        if not math.isfinite(r) or not -1 <= r <= 1:
+            return ("N/A", "undefined")
+        if r > 0.5:
             return ("Strong Buy", "strong_buy")
-        if r >= 0.1:
+        if r > 0.1:
             return ("Buy", "buy")
-        if r > -0.1:
+        if r >= -0.1:
             return ("Neutral", "neutral")
-        if r > -0.5:
+        if r >= -0.5:
             return ("Sell", "sell")
         return ("Strong Sell", "strong_sell")
 

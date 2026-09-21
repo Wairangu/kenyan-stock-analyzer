@@ -11,6 +11,7 @@ None and the rest of the pipeline is unaffected.
 """
 
 import statistics
+from data_quality import finite_number
 from datetime import datetime
 
 import requests
@@ -70,9 +71,8 @@ def compute_sector_medians(fundamentals_data):
                 v = r.get(key)
                 if v is None:
                     continue
-                try:
-                    v = float(v)
-                except (ValueError, TypeError):
+                v = finite_number(v)
+                if v is None:
                     continue
                 if positive_only and v <= 0:
                     continue
@@ -85,6 +85,8 @@ def compute_sector_medians(fundamentals_data):
             "dividend_yield": med("dividend_yield", positive_only=False),
             "roe": med("roe", positive_only=False),
             "count": len(rows),
+            **{f"{key}_count": sum(1 for r in rows if (finite_number(r.get(key)) or 0) > 0)
+               for key in ("pe_ratio", "price_to_book")},
         }
     return medians
 

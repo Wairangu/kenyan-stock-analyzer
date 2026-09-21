@@ -267,12 +267,13 @@ class EmailNotifier:
     </div>
 
     <div class="card"><div class="bar"></div>
-    <h2>Today's Buy &amp; Strong Buy Candidates</h2>
+    <h2>Today's Screened Candidates</h2>
+    <p>Ranked by factor score after price, history, liquidity and coverage checks. Scores are screening rules, not probabilities of profit.</p>
 """
         if candidates:
             html += """
     <table>
-        <tr><th>Symbol</th><th>Signal</th><th>Price</th><th title="0-100 factor screen. Dashed △ = fewer than 60% of factors had data">Score</th></tr>
+        <tr><th>Symbol</th><th>Signal</th><th>Price</th><th title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th></tr>
 """
             for c in candidates:
                 price_str = f"{c['price']:.2f}" if c.get('price') is not None else '—'
@@ -282,7 +283,7 @@ class EmailNotifier:
                 else:
                     sc_cls = 'score-high' if sc >= 70 else 'score-mid' if sc >= 45 else 'score-low'
                     coverage = c.get('score_coverage')
-                    partial = coverage is not None and coverage < 60
+                    partial = coverage is not None and coverage < 80
                     cls = f'score {sc_cls} partial' if partial else f'score {sc_cls}'
                     flag = ' <span class="score-flag">△</span>' if partial else ''
                     score_html = f'<span class="{cls}">{sc}{flag}</span>'
@@ -294,7 +295,7 @@ class EmailNotifier:
                 )
             html += "    </table>\n"
         else:
-            html += '    <p style="font-size:0.85rem; color:#667085; margin:0;">No Buy or Strong Buy signals today.</p>\n'
+            html += '    <p style="font-size:0.85rem; color:#667085; margin:0;">No Buy or Strong Buy signals today passed the data-quality and score requirements.</p>\n'
 
         # Track record — always shown, even when thin, rather than hiding
         # an unproven or low-sample-size call behind a confident number.
@@ -310,9 +311,16 @@ class EmailNotifier:
             ar = f"{t['avg_return_pct']:+.1f}%" if t.get('avg_return_pct') is not None else '—'
             return f"{label}: {n} call(s), {hr} hit rate, {ar} avg return"
 
+        model = track_record.get('portfolio', {})
+        model_return = model.get('avg_return_pct')
+        model_text = (f"Model portfolio: {model.get('n', 0)} non-overlapping periods, "
+                      f"{model_return:+.2f}% average price return after assumed costs."
+                      if model_return is not None else "Model portfolio: no completed periods yet.")
+
         html += f"""
     <p style="font-size:0.72rem; color:#98a2b3; margin:12px 0 0;">
-        Track record ({horizon}-trading-day forward return) &mdash;
+        {model_text}<br>
+        Selected-stock diagnostics ({horizon}-session holding period) &mdash;
         {_tier_line('Strong Buy', sb)}; {_tier_line('Buy', by)}.
         {track_record.get('note', '')}
     </p>
