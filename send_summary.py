@@ -71,7 +71,9 @@ def main():
 
     # ---- Data + analysis ----
     logger.info("Fetching stock data...")
-    stock_data = data_acq.fetch_all_stocks(period='6mo', interval='1d', force_refresh=force)
+    # 12-1 momentum needs ~13 months of bars; a 6-month window silently
+    # drops the factor for every name.
+    stock_data = data_acq.fetch_all_stocks(period='2y', interval='1d', force_refresh=force)
     if not stock_data:
         logger.error("No stock data — aborting summary")
         sys.exit(1)
@@ -140,11 +142,15 @@ def main():
 
     scores, alerts = {}, {}
     try:
-        from scoring import score_stock, generate_alerts
+        from scoring import score_universe, generate_alerts
+        # Rank only names that passed the live price checks, so stale or
+        # unverified quotes cannot shift every other name's percentile.
+        scores = score_universe(analysis_results, fundamentals_data,
+                                sector_medians=sector_medians,
+                                validations=validations)
         for sym, r in analysis_results.items():
             if r:
                 f = fundamentals_data.get(sym, {})
-                scores[sym] = score_stock(sym, r, f, sector_medians=sector_medians)
                 a = generate_alerts(sym, r, f, validations.get(sym))
                 if a:
                     alerts[sym] = a
@@ -182,7 +188,7 @@ def main():
     # deployed Lambda's job -- see aws/lambda_handler.py), so there's
     # honestly nothing to show here yet.
     track_record = {
-        "horizon_days": 10, "as_of": None, "tiers": {},
+        "horizon_days": 60, "as_of": None, "tiers": {},
         "note": "Track record isn't available from this script -- see the deployed dashboard.",
     }
     body = notifier.generate_email_body(

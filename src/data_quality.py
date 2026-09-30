@@ -40,6 +40,19 @@ def latest_completed_session(now=None):
     return day
 
 
+def next_session(day, steps=1):
+    """The NSE session `steps` sessions after `day`, skipping weekends and
+    public holidays. Shared so every forward-looking evaluation advances dates
+    the same way."""
+    if steps < 1:
+        raise ValueError("steps must be a positive integer")
+    for _ in range(steps):
+        day += timedelta(days=1)
+        while not is_session(day):
+            day += timedelta(days=1)
+    return day
+
+
 def parse_date(value):
     try:
         return date.fromisoformat(str(value)[:10])

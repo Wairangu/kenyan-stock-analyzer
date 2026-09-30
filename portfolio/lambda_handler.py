@@ -167,12 +167,49 @@ def _load_users():
         return {}
 
 
-def _save_users(users):
-    _s3.put_object(
-        Bucket=os.environ['TRADES_BUCKET'], Key=os.environ['USERS_KEY'],
-        Body=json.dumps({"users": users}, indent=2).encode(),
-        ContentType="application/json",
-    )
+def _mutate_s3_collection(key, collection_name, default_value, mutate):
+    """Atomically update a JSON collection using S3 conditional writes.
+
+    S3's ETag is used as a version token. If another request writes after our
+    read, the conditional PUT fails and we reload the latest value before
+    applying the change again. `IfNoneMatch` makes creation safe as well.
+    """
+    bucket = os.environ['TRADES_BUCKET']
+    for _ in range(8):
+        try:
+            response = _s3.get_object(Bucket=bucket, Key=key)
+            document = json.loads(response['Body'].read())
+            etag = response.get('ETag')
+            if not etag:
+                raise ValueError(f"S3 object {key} has no ETag for a safe update")
+        except Exception as exc:
+            code = getattr(exc, 'response', {}).get('Error', {}).get('Code')
+            if code not in ('NoSuchKey', '404', 'NotFound'):
+                raise
+            document, etag = {}, None
+
+        value = document.get(collection_name, default_value)
+        if not isinstance(value, type(default_value)):
+            raise ValueError(f"S3 object {key} has invalid {collection_name} data")
+        changed, result = mutate(value)
+        if not changed:
+            return result
+        document[collection_name] = value
+        request = {
+            'Bucket': bucket,
+            'Key': key,
+            'Body': json.dumps(document, indent=2, allow_nan=False).encode(),
+            'ContentType': 'application/json',
+        }
+        request['IfMatch' if etag else 'IfNoneMatch'] = etag if etag else '*'
+        try:
+            _s3.put_object(**request)
+            return result
+        except Exception as exc:
+            code = getattr(exc, 'response', {}).get('Error', {}).get('Code')
+            if code not in ('PreconditionFailed', '412', 'ConditionalRequestConflict', '409'):
+                raise
+    raise RuntimeError(f"Could not update {key} after concurrent writes; please retry")
 
 
 def _check_password(username, submitted):
@@ -191,26 +228,29 @@ def _must_change_password(username):
 
 
 def _set_password(username, plaintext):
-    users = _load_users()
-    user = users.setdefault(username, {})
-    user['password_hash'] = _hash_password(plaintext)
-    user['must_change_password'] = False
-    _save_users(users)
+    def update(users):
+        user = users.setdefault(username, {})
+        user['password_hash'] = _hash_password(plaintext)
+        user['must_change_password'] = False
+        return True, None
+
+    _mutate_s3_collection(os.environ['USERS_KEY'], 'users', {}, update)
 
 
 def _register_user(username, plaintext):
     """Create a new account. Caller must have already validated the username
     format and password rules. Returns False if the username is taken."""
-    users = _load_users()
-    if username in users:
-        return False
-    users[username] = {
-        'password_hash': _hash_password(plaintext),
-        'must_change_password': False,  # they chose this password themselves
-        'created_at': datetime.now(timezone.utc).isoformat(),
-    }
-    _save_users(users)
-    return True
+    def update(users):
+        if username in users:
+            return False, False
+        users[username] = {
+            'password_hash': _hash_password(plaintext),
+            'must_change_password': False,  # they chose this password themselves
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+        return True, True
+
+    return _mutate_s3_collection(os.environ['USERS_KEY'], 'users', {}, update)
 
 
 # ---- Trade storage (S3 JSON, tolerant load -- style matches src/foreign_flows.py) ----
@@ -228,11 +268,9 @@ def _load_trades(username):
         return []
 
 
-def _save_trades(username, trades):
-    _s3.put_object(
-        Bucket=os.environ['TRADES_BUCKET'], Key=f"{os.environ['TRADES_PREFIX']}{username}.json",
-        Body=json.dumps({"trades": trades}, indent=2).encode(),
-        ContentType="application/json",
+def _update_trades(username, mutate):
+    return _mutate_s3_collection(
+        f"{os.environ['TRADES_PREFIX']}{username}.json", 'trades', [], mutate,
     )
 
 
@@ -274,6 +312,15 @@ def _fifo_positions(trades, prices):
     """
     by_symbol = {}
     for t in trades:
+        if not isinstance(t, dict) or not isinstance(t.get('symbol'), str):
+            continue
+        try:
+            qty, price = float(t['quantity']), float(t['price'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if (not math.isfinite(qty) or qty <= 0 or not math.isfinite(price)
+                or price <= 0 or t.get('side') not in ('buy', 'sell', 'dividend')):
+            continue
         by_symbol.setdefault(t['symbol'], []).append(t)
 
     positions = {}
@@ -588,11 +635,13 @@ def _render_track_record_panel(track_record):
         <div class="stat"><div class="big">{hit_rate}</div><div class="label">{_esc(label)} hit rate</div></div>
         <div class="stat"><div class="big">{avg_ret}</div><div class="label">{_esc(label)} avg return</div></div>"""
     horizon = track_record.get('horizon_days', '—')
+    breakeven = track_record.get('breakeven_pct')
     note = track_record.get('note', 'No track record available.')
     return f"""
     <div class="card">
       <h2>Track record</h2>
       <p class="note">Forward return measured {_esc(str(horizon))} trading days after each call. {_esc(note)}</p>
+      <p class="note">Every round trip must first clear {_esc(f"{breakeven:.2f}") if breakeven is not None else "—"}% in commission and slippage.</p>
       <div class="track-stats">{stats_html}</div>
     </div>"""
 
@@ -616,7 +665,56 @@ def _render_recommend_form(track_record, error=None):
     return _page("What should I buy? — Portfolio", body)
 
 
-def _render_recommend_result(allocations, leftover_kes, budget_kes, track_record, rec_date):
+def _holdings_review(positions, data):
+    """Split current holdings into keep and review, using the analyzer's
+    retention list.
+
+    Hysteresis is an exit rule, not an entry one: a name already held is kept
+    while its score stays in the dead band below the entry bar, because
+    rotating out of it and back in pays the full round trip for a rank change
+    that is mostly noise. A name that has fallen through the dead band is
+    flagged for review here rather than sold automatically -- and either way no
+    new money is allocated to it, since only entry-grade candidates reach the
+    allocator.
+    """
+    retained = {c['symbol']: c for c in (data.get('hold_candidates') or [])
+                if isinstance(c, dict) and c.get('symbol')}
+    keep, review = [], []
+    for symbol, position in sorted(positions.items()):
+        if position.get('qty', 0) <= 0:
+            continue
+        candidate = retained.get(symbol)
+        (keep if candidate else review).append((symbol, candidate))
+    return keep, review
+
+
+def _render_holdings_review(positions, data):
+    keep, review = _holdings_review(positions, data)
+    if not keep and not review:
+        return ''
+    rows = ''
+    for symbol, candidate in keep:
+        score = candidate.get('score')
+        rows += (f'<tr><td><strong>{_esc(symbol)}</strong></td><td>Keep</td>'
+                 f'<td>{score if score is not None else "—"}</td>'
+                 f'<td>Still above the hold threshold.</td></tr>')
+    for symbol, _ in review:
+        rows += (f'<tr><td><strong>{_esc(symbol)}</strong></td><td>Review</td><td>—</td>'
+                 f'<td>Below the hold threshold, or today\'s price and data checks did '
+                 f'not pass. Check the dashboard before acting.</td></tr>')
+    if not (data.get('hold_candidates') or []):
+        return ''
+    return f"""
+    <div class="card">
+      <h2>Holdings review</h2>
+      <table><thead><tr><th>Symbol</th><th>Status</th><th>Score</th><th>Why</th></tr></thead>
+      <tbody>{rows}</tbody></table>
+      <p class="note" style="margin-top:10px;">A held name is kept while its score stays in the dead band below the entry bar, so a small rank change does not trigger a round trip. This is a prompt to review, never an instruction to sell, and no new money is allocated to a name that only clears the hold bar.</p>
+    </div>"""
+
+
+def _render_recommend_result(allocations, leftover_kes, budget_kes, track_record, rec_date,
+                             positions=None, data=None):
     today = datetime.now(timezone.utc).date().isoformat()
     rows = ''
     for a in allocations:
@@ -647,6 +745,7 @@ def _render_recommend_result(allocations, leftover_kes, budget_kes, track_record
       <h1>🎯 Buy {budget_kes:,.0f} KES{date_note}</h1>
     </div>
     {_render_track_record_panel(track_record)}
+    {_render_holdings_review(positions or {}, data or {})}
     <div class="card">
       <h2>Recommended buy list</h2>
       <table><thead><tr><th>Symbol</th><th>Signal</th><th>Score</th><th>Shares</th>
@@ -815,6 +914,7 @@ def _route(event):
             return _html_response(_render_recommend_form(data.get('track_record'), error=str(exc)), status=400)
         return _html_response(_render_recommend_result(
             allocations, leftover_kes, budget, data.get('track_record'), data.get('date'),
+            positions=positions, data=data,
         ))
 
     if path == "/trades" and method == "POST":
@@ -825,24 +925,37 @@ def _route(event):
             quantity = float(form.get('quantity', [''])[0])
             price = float(form.get('price', [''])[0])
             date = (form.get('date', [''])[0] or '').strip()
-            if not symbol or side not in ('buy', 'sell', 'dividend') or quantity <= 0 or price <= 0 or not date:
+            if (not symbol or side not in ('buy', 'sell', 'dividend')
+                    or not math.isfinite(quantity) or quantity <= 0
+                    or not math.isfinite(price) or price <= 0 or not date):
                 raise ValueError("incomplete or invalid trade")
         except (ValueError, IndexError):
             return _html_response(
                 _render_error("Invalid trade — check symbol, side, quantity, price and date."), status=400,
             )
-        trades = _load_trades(username)
-        trades.append({
+        trade = {
             'id': str(uuid.uuid4()), 'symbol': symbol, 'side': side,
             'quantity': quantity, 'price': price, 'date': date,
-        })
-        _save_trades(username, trades)
+        }
+
+        def append_trade(trades):
+            trades.append(trade)
+            return True, None
+
+        _update_trades(username, append_trade)
         return _redirect("/")
 
     if path.startswith("/trades/") and path.endswith("/delete") and method == "POST":
         trade_id = path.split('/')[2] if len(path.split('/')) > 2 else None
-        trades = [t for t in _load_trades(username) if t.get('id') != trade_id]
-        _save_trades(username, trades)
+
+        def remove_trade(trades):
+            kept = [t for t in trades if t.get('id') != trade_id]
+            if len(kept) == len(trades):
+                return False, None
+            trades[:] = kept
+            return True, None
+
+        _update_trades(username, remove_trade)
         return _redirect("/")
 
     return {"statusCode": 404, "headers": {"Content-Type": "text/plain"}, "body": "Not found"}

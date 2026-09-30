@@ -1,10 +1,19 @@
 """
-Transparent factor-scoring & screening module.
+Transparent factor-scoring & screening module (strategy `screen-v3`).
 
-Combines the metrics the pipeline already gathers (valuation, quality,
-momentum, dividend, liquidity) into a transparent 0-100 score PER FACTOR and
-an overall blend. Every input and every point is exposed in `reasons`, so the
-score is a screen you can inspect and tune — never a black box.
+Combines the metrics the pipeline already gathers (valuation, quality, growth,
+momentum, dividend, liquidity) into a transparent 0-100 score PER FACTOR and an
+overall blend. Every input and every point is exposed in `reasons`, so the score
+is a screen you can inspect and tune -- never a black box.
+
+Scores are CROSS-SECTIONAL. Each metric is converted to its percentile rank
+against the same day's universe rather than through a hand-picked linear
+mapping. That removes the invented constants, restores discrimination where the
+universe actually clusters (most NSE banks trade under 1x book, which an
+absolute P/B anchor pins at 100 for all of them), and self-calibrates when the
+whole market rerates. Absolute anchors survive only as the fallback for a
+universe too small to rank -- a single-stock run, or a metric almost nobody
+reports.
 
 This is a mechanical screen of public metrics, NOT investment advice.
 
@@ -12,14 +21,16 @@ Also produces per-stock alerts (oversold, near 52-week low, strong signal,
 high sustainable yield, illiquid, price-source mismatch) for the dashboard.
 """
 
+import math
+import statistics
+from collections import namedtuple
+
 from logger import get_logger
-from data_quality import finite_number
+from data_quality import finite_number, latest_completed_session, parse_date
 
 logger = get_logger(__name__)
 
 # Baseline policy weights, not fitted return forecasts or probabilities.
-# Value, quality and liquidity each gave up a little weight to make room
-# for growth, a standard factor that was previously missing entirely.
 DEFAULT_WEIGHTS = {
     "value": 0.20,
     "quality": 0.20,
@@ -29,146 +40,291 @@ DEFAULT_WEIGHTS = {
     "liquidity": 0.10,
 }
 
+# Ranking a handful of names says nothing about where a stock sits in the
+# market, so below this many valid observations the absolute anchor is used.
+MIN_CROSS_SECTION = 8
+# A sector median needs this many observations before it beats the universe.
+MIN_PEER_COUNT = 3
+
 
 def _clamp(x, lo=0.0, hi=100.0):
     return max(lo, min(hi, x))
 
 
-def _relative_to_sector(value, median):
+# ---------------------------------------------------------------------------
+# Metric registry
+# ---------------------------------------------------------------------------
+# `anchor` is the pre-v3 fixed mapping, kept only as the small-universe
+# fallback. `sector_relative` metrics are ranked as a ratio to their sector
+# median (or the universe median) so a bank and a manufacturer are not judged
+# against the same raw P/E.
+
+Metric = namedtuple(
+    "Metric", "key factor lower_is_better sector_relative valid anchor label")
+
+
+def _positive(value, row):
+    return value > 0
+
+
+def _nonnegative(value, row):
+    return value >= 0
+
+
+def _any_value(value, row):
+    return True
+
+
+def _dividend_payer(value, row):
+    payout = row.get("dividend_payout_ratio")
+    return value > 0 and payout is not None and 0 < payout <= 100
+
+
+METRICS = (
+    Metric("pe_ratio", "value", True, True, _positive,
+           lambda v: _clamp(100 - (v - 8) * 4), lambda v: f"P/E {v:.1f}"),
+    Metric("price_to_book", "value", True, True, _positive,
+           lambda v: _clamp(100 - (v - 1) * 30), lambda v: f"P/B {v:.2f}"),
+    Metric("peg_ratio", "value", True, False, _positive,
+           lambda v: _clamp(100 - (v - 0.5) * 50), lambda v: f"PEG {v:.2f}"),
+
+    Metric("roe", "quality", False, False, _any_value,
+           lambda v: _clamp(v * 4), lambda v: f"ROE {v:.1f}%"),
+    Metric("roa", "quality", False, False, _any_value,
+           lambda v: _clamp(v * 50), lambda v: f"ROA {v:.1f}%"),
+    Metric("net_margin", "quality", False, False, _any_value,
+           lambda v: _clamp(v * 3.3), lambda v: f"net margin {v:.1f}%"),
+    Metric("debt_to_equity", "quality", True, False, _nonnegative,
+           lambda v: _clamp(100 - v * 40), lambda v: f"D/E {v:.2f}"),
+    Metric("current_ratio", "quality", False, False, _positive,
+           lambda v: _clamp(v * 50), lambda v: f"current ratio {v:.2f}"),
+
+    Metric("eps_growth_yoy", "growth", False, False, _any_value,
+           lambda v: _clamp(50 + v * 2), lambda v: f"EPS growth {v:+.1f}%"),
+    Metric("revenue_growth_yoy", "growth", False, False, _any_value,
+           lambda v: _clamp(50 + v * 2.5), lambda v: f"revenue growth {v:+.1f}%"),
+
+    Metric("momentum_12_1", "momentum", False, False, _any_value,
+           lambda v: _clamp(50 + v), lambda v: f"12-1 momentum {v:+.1f}%"),
+
+    Metric("dividend_yield", "dividend", False, False, _dividend_payer,
+           lambda v: _clamp(v * 12.5), lambda v: f"annual yield {v:.1f}%"),
+
+    Metric("median_value_traded_20d", "liquidity", False, False, _positive,
+           lambda v: _clamp((math.log10(v) - 6) * 33),
+           lambda v: f"20-session median traded KES {v/1e6:.1f}M"),
+)
+
+METRICS_BY_KEY = {m.key: m for m in METRICS}
+
+# Which quality metrics apply to which kind of issuer. Deposits and regulatory
+# liquidity are not industrial working capital, so banks and insurers are
+# judged on returns rather than on debt and current ratios.
+FINANCIAL_SECTORS = ("Finance", "Banking", "Insurance")
+QUALITY_METRICS_FINANCIAL = ("roe", "roa")
+QUALITY_METRICS_INDUSTRIAL = ("roe", "net_margin", "debt_to_equity", "current_ratio")
+
+NUMERIC_FIELDS = (
+    "pe_ratio", "price_to_book", "peg_ratio", "roe", "roa", "net_margin",
+    "debt_to_equity", "current_ratio", "eps_growth_yoy", "revenue_growth_yoy",
+    "momentum_12_1", "perf_3m", "dividend_yield", "dividend_payout_ratio",
+    "median_value_traded_20d",
+)
+
+
+def _metric_row(analysis_result, fund):
+    """Merge the fundamental and price-derived inputs one score needs."""
+    result = analysis_result or {}
+    row = dict(fund or {})
+    row["momentum_12_1"] = (result.get("momentum_12_1")
+                            if row.get("momentum_12_1") is None
+                            else row.get("momentum_12_1"))
+    row["median_value_traded_20d"] = result.get("median_value_traded_20d")
+    for key in NUMERIC_FIELDS:
+        row[key] = finite_number(row.get(key))
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Cross-section
+# ---------------------------------------------------------------------------
+
+def _percentile_ranks(values, lower_is_better):
+    """Midrank percentiles in (0, 100). Ties share a rank; no value is pinned.
+
+    Percentiles are used rather than z-scores because NSE metrics are heavily
+    skewed and a single outlier would otherwise compress everyone else.
     """
-    Score a "lower is cheaper" metric (P/E, P/B) relative to its sector
-    median instead of a fixed anchor: 0.5x median -> 100, 1.0x (in line
-    with peers) -> ~67, 2.0x median -> 0. Returns None if no median.
-    A bank and a manufacturer shouldn't be judged against the same fixed
-    P/E number, so this is preferred whenever a sector median is available.
+    ordered = sorted(values.items(), key=lambda item: item[1])
+    n = len(ordered)
+    ranks = {}
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and ordered[j + 1][1] == ordered[i][1]:
+            j += 1
+        midrank = (i + j) / 2 + 1  # 1-based, averaged over the tied block
+        pct = 100 * (midrank - 0.5) / n
+        for symbol, _ in ordered[i:j + 1]:
+            ranks[symbol] = round(100 - pct, 1) if lower_is_better else round(pct, 1)
+        i = j + 1
+    return ranks
+
+
+class CrossSection:
+    """Percentile rank of every metric across one day's universe."""
+
+    def __init__(self, ranks=None, sizes=None):
+        self._ranks = ranks or {}
+        self._sizes = sizes or {}
+
+    def rank(self, key, symbol):
+        return self._ranks.get(key, {}).get(symbol)
+
+    def size(self, key):
+        return self._sizes.get(key, 0)
+
+
+def build_cross_section(rows, sector_medians=None):
+    """Rank every registered metric across `rows` ({symbol: metric row}).
+
+    A metric with fewer than MIN_CROSS_SECTION valid observations is left
+    unranked, and scoring falls back to that metric's absolute anchor.
     """
-    if not median or median <= 0:
-        return None
-    ratio = value / median
-    return _clamp(133.33 - 66.67 * ratio)
+    ranks, sizes = {}, {}
+    for metric in METRICS:
+        raw = {}
+        for symbol, row in rows.items():
+            value = finite_number(row.get(metric.key))
+            if value is None or not metric.valid(value, row):
+                continue
+            raw[symbol] = value
+        sizes[metric.key] = len(raw)
+        if len(raw) < MIN_CROSS_SECTION:
+            continue
+        if metric.sector_relative:
+            universe_median = statistics.median(raw.values())
+            normalized = {}
+            for symbol, value in raw.items():
+                sector = rows[symbol].get("sector")
+                med = (sector_medians or {}).get(sector, {}) if sector else {}
+                peer = med.get(metric.key) if med.get(f"{metric.key}_count", 0) >= MIN_PEER_COUNT else None
+                base = peer if peer and peer > 0 else universe_median
+                normalized[symbol] = value / base if base and base > 0 else value
+            raw = normalized
+        ranks[metric.key] = _percentile_ranks(raw, metric.lower_is_better)
+    return CrossSection(ranks, sizes)
 
 
-def _score_value(fund, sector_medians=None):
-    """Lower P/E, P/B and PEG score higher — relative to the stock's own
-    sector when a median is available, else a fixed anchor. Returns
-    (score, reasons)."""
+def _score_metric(metric, row, symbol, ctx):
+    """One metric as 0-100, by percentile rank when ranked, else by anchor.
+
+    Returns (score, reason) or (None, None) when the metric is unusable.
+    """
+    value = finite_number(row.get(metric.key))
+    if value is None or not metric.valid(value, row):
+        return None, None
+    rank = ctx.rank(metric.key, symbol) if ctx else None
+    if rank is not None:
+        return rank, f"{metric.label(value)} (rank {rank:.0f}/100 of {ctx.size(metric.key)})"
+    return metric.anchor(value), metric.label(value)
+
+
+def _score_from_keys(keys, row, symbol, ctx, empty_reason):
     parts, reasons = [], []
-    sector = fund.get("sector")
-    med = (sector_medians or {}).get(sector, {}) if sector else {}
-
-    pe = fund.get("pe_ratio")
-    if pe and pe > 0:
-        s = _relative_to_sector(pe, med.get("pe_ratio") if med.get("pe_ratio_count", 0) >= 3 else None)
-        if s is not None:
-            parts.append(s)
-            reasons.append(f"P/E {pe:.1f} (vs sector)")
-        else:
-            parts.append(_clamp(100 - (pe - 8) * 4))  # pe 8 -> 100, pe 33 -> 0
-            reasons.append(f"P/E {pe:.1f}")
-    pb = fund.get("price_to_book")
-    if pb and pb > 0:
-        s = _relative_to_sector(pb, med.get("price_to_book") if med.get("price_to_book_count", 0) >= 3 else None)
-        if s is not None:
-            parts.append(s)
-            reasons.append(f"P/B {pb:.2f} (vs sector)")
-        else:
-            parts.append(_clamp(100 - (pb - 1) * 30))  # pb 1 -> 100, pb ~4.3 -> 0
-            reasons.append(f"P/B {pb:.2f}")
-    peg = fund.get("peg_ratio")
-    if peg and peg > 0:
-        # No sector median tracked for PEG -- always the fixed anchor.
-        s = _clamp(100 - (peg - 0.5) * 50)  # peg 0.5 -> 100, peg 2.5 -> 0
-        parts.append(s)
-        reasons.append(f"PEG {peg:.2f}")
+    for key in keys:
+        score, reason = _score_metric(METRICS_BY_KEY[key], row, symbol, ctx)
+        if score is None:
+            continue
+        parts.append(score)
+        reasons.append(reason)
     if not parts:
-        return None, ["no valuation data"]
-    return round(sum(parts) / len(parts)), reasons
+        return None, [empty_reason], 0
+    return round(sum(parts) / len(parts)), reasons, len(parts)
 
 
-def _score_quality(fund):
-    """Higher ROE/margins, lower leverage score higher."""
-    parts, reasons = [], []
-    roe = fund.get("roe")
-    if roe is not None:
-        parts.append(_clamp(roe * 4))  # roe 25% -> 100
-        reasons.append(f"ROE {roe:.1f}%")
-    if fund.get("sector") in ("Finance", "Banking", "Insurance"):
-        # Deposits and regulatory liquidity are not industrial working capital.
-        roa = fund.get("roa")
-        if roa is not None:
-            parts.append(_clamp(roa * 50))
-            reasons.append(f"ROA {roa:.1f}%")
-        reasons.append("financial firm: leverage/current ratio excluded; loan quality and regulatory capital need review")
-        return (round(sum(parts) / len(parts)) if parts else None), reasons
-    nm = fund.get("net_margin")
-    if nm is not None:
-        parts.append(_clamp(nm * 3.3))  # ~30% -> 100
-        reasons.append(f"net margin {nm:.1f}%")
-    de = fund.get("debt_to_equity")
-    if de is not None and de >= 0:
-        parts.append(_clamp(100 - de * 40))  # de 0 -> 100, de 2.5 -> 0
-        reasons.append(f"D/E {de:.2f}")
-    cr = fund.get("current_ratio")
-    if cr is not None and cr > 0:
-        parts.append(_clamp(cr * 50))  # cr 2 -> 100
-        reasons.append(f"current ratio {cr:.2f}")
-    if not parts:
-        return None, ["no quality data"]
-    return round(sum(parts) / len(parts)), reasons
+# ---------------------------------------------------------------------------
+# Factors
+# ---------------------------------------------------------------------------
+
+def _score_value(fund, sector_medians=None, symbol=None, ctx=None):
+    """Cheaper P/E, P/B and PEG score higher, ranked against the universe
+    (P/E and P/B relative to the stock's own sector first)."""
+    score, reasons, _ = _score_from_keys(
+        ("pe_ratio", "price_to_book", "peg_ratio"), fund, symbol, ctx,
+        "no valuation data")
+    return score, reasons
 
 
-def _score_growth(fund):
-    """Higher YoY EPS/revenue growth scores higher. A standard factor
-    alongside value/quality/momentum -- rewards an expanding business
+def _score_quality(fund, symbol=None, ctx=None):
+    """Higher returns and margins, lower leverage score higher."""
+    if fund.get("sector") in FINANCIAL_SECTORS:
+        score, reasons, _ = _score_from_keys(
+            QUALITY_METRICS_FINANCIAL, fund, symbol, ctx, "no quality data")
+        reasons = list(reasons) + [
+            "financial firm: leverage/current ratio excluded; "
+            "loan quality and regulatory capital need review"]
+        return score, reasons
+    score, reasons, _ = _score_from_keys(
+        QUALITY_METRICS_INDUSTRIAL, fund, symbol, ctx, "no quality data")
+    return score, reasons
+
+
+def _score_growth(fund, symbol=None, ctx=None):
+    """Higher YoY EPS/revenue growth scores higher -- an expanding business
     rather than just a cheap or a trending one."""
-    parts, reasons = [], []
-    eps_g = fund.get("eps_growth_yoy")
-    if eps_g is not None:
-        parts.append(_clamp(50 + eps_g * 2))  # +25% YoY EPS growth -> 100
-        reasons.append(f"EPS growth {eps_g:+.1f}%")
-    rev_g = fund.get("revenue_growth_yoy")
-    if rev_g is not None:
-        parts.append(_clamp(50 + rev_g * 2.5))  # +20% YoY revenue growth -> 100
-        reasons.append(f"revenue growth {rev_g:+.1f}%")
-    if not parts:
-        return None, ["no growth data"]
-    return round(sum(parts) / len(parts)), reasons
+    score, reasons, _ = _score_from_keys(
+        ("eps_growth_yoy", "revenue_growth_yoy"), fund, symbol, ctx,
+        "no growth data")
+    return score, reasons
 
 
-def _score_momentum(analysis_result, fund):
-    """Trend/MACD/RSI and 3-month performance."""
-    parts, reasons = [], []
+# The 12-1 return is the momentum factor; the trend state only confirms it.
+MOMENTUM_PRIMARY_WEIGHT = 2
+MOMENTUM_TREND_WEIGHT = 1
+
+
+def _score_momentum(analysis_result, fund, symbol=None, ctx=None):
+    """12-month return excluding the latest month, confirmed by trend state.
+
+    RSI is deliberately absent. It is a mean-reversion oscillator, so scoring
+    it linearly rewarded exactly the overbought names `generate_alerts` warns
+    about. 3-month return is absent for the same reason -- short-horizon
+    returns reverse, while the documented momentum effect lives at 12-1.
+    RSI survives as an alert, and `perf_3m` as a reported statistic.
+    """
     signals = (analysis_result or {}).get("signals", {})
-    latest = (analysis_result or {}).get("latest", {})
+    row = dict(fund or {})
+    if row.get("momentum_12_1") is None:
+        row["momentum_12_1"] = (analysis_result or {}).get("momentum_12_1")
+    row["momentum_12_1"] = finite_number(row.get("momentum_12_1"))
+
+    weighted, total, reasons = 0.0, 0.0, []
+
+    score, reason = _score_metric(METRICS_BY_KEY["momentum_12_1"], row, symbol, ctx)
+    if score is not None:
+        weighted += score * MOMENTUM_PRIMARY_WEIGHT
+        total += MOMENTUM_PRIMARY_WEIGHT
+        reasons.append(reason)
+    else:
+        reasons.append("no 12-1 momentum: needs ~12 months of history")
 
     overall = signals.get("overall")
-    if overall == "bullish":
-        parts.append(75); reasons.append("technical: bullish")
-    elif overall == "bearish":
-        parts.append(25); reasons.append("technical: bearish")
-    elif overall == "neutral":
-        parts.append(50); reasons.append("technical: neutral")
+    trend = {"bullish": 75, "neutral": 50, "bearish": 25}.get(overall)
+    if trend is not None:
+        weighted += trend * MOMENTUM_TREND_WEIGHT
+        total += MOMENTUM_TREND_WEIGHT
+        reasons.append(f"technical: {overall}")
 
-    rsi = latest.get("rsi")
-    if rsi is not None:
-        # Continuous momentum score; no discontinuity at RSI 30 or 70.
-        parts.append(_clamp(rsi))
-        reasons.append(f"RSI {rsi:.0f}")
-
-    perf = fund.get("perf_3m")
-    if perf is not None:
-        parts.append(_clamp(50 + perf * 2))  # +25% -> 100
-        reasons.append(f"3M {perf:+.1f}%")
-
-    if not parts:
+    if total == 0:
         return None, ["no momentum data"]
-    return round(sum(parts) / len(parts)), reasons
+    return round(weighted / total), reasons
 
 
-def _score_dividend(fund):
+def _score_dividend(fund, symbol=None, ctx=None):
     """Reward yield, but only if the payout looks sustainable."""
-    dy = fund.get("dividend_yield")
-    payout = fund.get("dividend_payout_ratio")
+    dy = finite_number(fund.get("dividend_yield"))
+    payout = finite_number(fund.get("dividend_payout_ratio"))
     if dy is None or dy < 0:
         return None, ["no annual dividend yield"]
     if dy == 0:
@@ -177,22 +333,27 @@ def _score_dividend(fund):
         return None, ["dividend sustainability unknown: payout missing"]
     if payout <= 0 or payout > 100:
         return 0, [f"yield {dy:.1f}%; payout {payout:.0f}% is not covered by earnings"]
-    return round(_clamp(dy * 12.5)), [f"annual yield {dy:.1f}%; payout {payout:.0f}%"]
+    score, reason = _score_metric(METRICS_BY_KEY["dividend_yield"], fund, symbol, ctx)
+    return round(score), [f"{reason}; payout {payout:.0f}%"]
 
 
-def _score_liquidity(fund):
+def _score_liquidity(fund, symbol=None, ctx=None):
     """Higher traded value = easier to enter/exit. KES value traded per day."""
-    vt = fund.get("median_value_traded_20d")
+    vt = finite_number(fund.get("median_value_traded_20d"))
     if vt is None or vt < 0:
         return None, ["no liquidity data"]
     if vt == 0:
         return 0, ["zero median traded value over 20 sessions"]
-    import math
-    s = _clamp((math.log10(vt) - 6) * 33)  # 1e6 ->0, 1e9 ->99
-    return round(s), [f"20-session median traded KES {vt/1e6:.1f}M"]
+    score, reason = _score_metric(METRICS_BY_KEY["median_value_traded_20d"], fund, symbol, ctx)
+    return round(score), [reason]
 
 
-def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None):
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None,
+                cross_section=None):
     """
     Produce a transparent factor score for one stock.
 
@@ -201,27 +362,21 @@ def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None
     Sub-scores are 0-100 or None when data is missing. `overall` is the
     weighted blend of the available sub-scores (weights renormalised).
 
-    `sector_medians` (optional, from market_context.compute_sector_medians)
-    lets the value factor score P/E and P/B relative to the stock's own
-    sector instead of a fixed anchor; omitted or missing-sector stocks
-    fall back to the fixed anchor automatically.
+    `cross_section` comes from `build_cross_section` (see `score_universe`) and
+    is what turns raw metrics into percentile ranks. Without it -- a one-off
+    single-stock call -- every metric falls back to its absolute anchor, so the
+    result is comparable to the pre-v3 score but not to a ranked universe.
     """
     weights = weights or DEFAULT_WEIGHTS
-    fund = dict(fund or {})
-    numeric_fields = ("pe_ratio", "price_to_book", "peg_ratio", "roe", "roa",
-                      "net_margin", "debt_to_equity", "current_ratio", "eps_growth_yoy",
-                      "revenue_growth_yoy", "perf_3m", "dividend_yield", "dividend_payout_ratio")
-    for key in numeric_fields:
-        fund[key] = finite_number(fund.get(key))
-    fund['median_value_traded_20d'] = finite_number((analysis_result or {}).get('median_value_traded_20d'))
+    row = _metric_row(analysis_result, fund)
 
     subs = {
-        "value": _score_value(fund, sector_medians),
-        "quality": _score_quality(fund),
-        "growth": _score_growth(fund),
-        "momentum": _score_momentum(analysis_result, fund),
-        "dividend": _score_dividend(fund),
-        "liquidity": _score_liquidity(fund),
+        "value": _score_value(row, sector_medians, symbol, cross_section),
+        "quality": _score_quality(row, symbol, cross_section),
+        "growth": _score_growth(row, symbol, cross_section),
+        "momentum": _score_momentum(analysis_result, row, symbol, cross_section),
+        "dividend": _score_dividend(row, symbol, cross_section),
+        "liquidity": _score_liquidity(row, symbol, cross_section),
     }
 
     scores = {k: v[0] for k, v in subs.items()}
@@ -244,6 +399,15 @@ def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None
     total_weight = sum(weights.values()) or 1.0
     factors_present = sum(1 for s in scores.values() if s is not None)
 
+    # How many raw metrics sat behind each factor. Coverage alone can read 100
+    # while every factor rests on a single metric, so this is reported
+    # alongside it -- it is diagnostic, not yet a screening rule.
+    metric_counts = {}
+    for key, metric in METRICS_BY_KEY.items():
+        value = finite_number(row.get(key))
+        if value is not None and metric.valid(value, row):
+            metric_counts[metric.factor] = metric_counts.get(metric.factor, 0) + 1
+
     return {
         "symbol": symbol,
         "overall": overall,
@@ -252,6 +416,55 @@ def score_stock(symbol, analysis_result, fund, weights=None, sector_medians=None
         "coverage": round(100 * den / total_weight) if overall is not None else 0,
         "factors_present": factors_present,
         "factors_total": len(scores),
+        "metric_counts": metric_counts,
+        "ranked": bool(cross_section and any(
+            cross_section.size(m.key) >= MIN_CROSS_SECTION for m in METRICS)),
+    }
+
+
+def score_universe(analysis_results, fundamentals_data=None, weights=None,
+                   sector_medians=None, *, validations=None, as_of=None):
+    """Score every stock against the same day's cross-section.
+
+    This is the entry point callers should use: percentile ranks only mean
+    something when every name is ranked against the same universe on the same
+    date. Returns {symbol: score dict}.
+    """
+    fundamentals_data = fundamentals_data or {}
+    expected = None
+    if validations is not None:
+        expected = parse_date(as_of) if as_of is not None else latest_completed_session()
+        if expected is None:
+            raise ValueError("as_of must be an ISO date")
+    rows = {}
+    for symbol, result in (analysis_results or {}).items():
+        if not result:
+            continue
+        # In production, calculate ranks only from names that could enter the
+        # screened universe. Otherwise stale, misidentified, or illiquid names
+        # move every other name's percentile despite being ineligible later.
+        # `validations=None` preserves the utility's data-only mode for callers
+        # that do not have the independent live-price checks available.
+        if validations is not None:
+            validation = validations.get(symbol) or {}
+            latest = result.get("latest") or {}
+            close = finite_number(latest.get("close"))
+            liquidity = finite_number(result.get("median_value_traded_20d"))
+            if (close is None or close <= 0
+                    or result.get("identity_verified") is not True
+                    or result.get("history_complete") is not True
+                    or parse_date(result.get("history_date")) != expected
+                    or validation.get("status") != "ok"
+                    or validation.get("is_stale") is not False
+                    or liquidity is None or liquidity < 1_000_000):
+                continue
+        rows[symbol] = _metric_row(result, fundamentals_data.get(symbol, {}))
+    ctx = build_cross_section(rows, sector_medians)
+    return {
+        symbol: score_stock(symbol, (analysis_results or {}).get(symbol),
+                            fundamentals_data.get(symbol, {}), weights,
+                            sector_medians, cross_section=ctx)
+        for symbol, result in (analysis_results or {}).items() if result
     }
 
 
@@ -305,8 +518,9 @@ def generate_alerts(symbol, analysis_result, fund, validation=None):
     if fund.get("dividend_ex_date_is_upcoming") and fund.get("dividend_ex_date"):
         alerts.append(f"📅 Ex-dividend {fund['dividend_ex_date']}")
 
-    # Illiquid warning
-    vt = fund.get("value_traded")
+    # Illiquid warning: the same sustained measure the buy list screens on,
+    # so an alert can no longer contradict eligibility.
+    vt = (analysis_result or {}).get("median_value_traded_20d")
     if vt is not None and vt < 1_000_000:
         alerts.append("💧 Thinly traded (hard to exit)")
 
@@ -325,10 +539,10 @@ if __name__ == "__main__":
     files = glob.glob("../data/fundamentals_*.json")
     if files:
         data = json.load(open(files[0]))
+        scores = score_universe({s: {} for s in data}, data)
         for sym in ["SCOM", "KCB", "EQTY", "HAFR"]:
-            f = data.get(sym, {})
-            sc = score_stock(sym, {}, f)
-            print(f"\n{sym}: overall={sc['overall']}  "
-                  f"V={sc['value']} Q={sc['quality']} M={sc['momentum']} "
-                  f"D={sc['dividend']} L={sc['liquidity']}")
-            print("   alerts:", generate_alerts(sym, {}, f))
+            sc = scores.get(sym, {})
+            print(f"\n{sym}: overall={sc.get('overall')}  "
+                  f"V={sc.get('value')} Q={sc.get('quality')} M={sc.get('momentum')} "
+                  f"D={sc.get('dividend')} L={sc.get('liquidity')}")
+            print("   alerts:", generate_alerts(sym, {}, data.get(sym, {})))

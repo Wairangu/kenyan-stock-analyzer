@@ -273,7 +273,7 @@ class EmailNotifier:
         if candidates:
             html += """
     <table>
-        <tr><th>Symbol</th><th>Signal</th><th>Price</th><th title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th></tr>
+        <tr><th>Symbol</th><th>Signal</th><th>Price</th><th title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th><th title="Percent the price must rise before commission and slippage on both sides are covered">Break-even</th></tr>
 """
             for c in candidates:
                 price_str = f"{c['price']:.2f}" if c.get('price') is not None else '—'
@@ -287,11 +287,18 @@ class EmailNotifier:
                     cls = f'score {sc_cls} partial' if partial else f'score {sc_cls}'
                     flag = ' <span class="score-flag">△</span>' if partial else ''
                     score_html = f'<span class="{cls}">{sc}{flag}</span>'
+                # The round-trip hurdle sits next to the score on purpose:
+                # the screen produces no expected return, so the cost a
+                # position must clear should never be out of sight.
+                be = c.get('breakeven_pct')
+                be_str = f'+{be:.2f}%' if be is not None else '—'
+                held = ' <span class="score-flag" title="Already held: kept under the lower hold threshold">H</span>' if c.get('held') else ''
                 html += (
-                    f'        <tr><td><strong>{c["symbol"]}</strong></td>'
+                    f'        <tr><td><strong>{c["symbol"]}</strong>{held}</td>'
                     f'<td><span class="badge {c["tv_class"]}">{c["tv_label"]}</span></td>'
                     f'<td>{price_str}</td>'
-                    f'<td>{score_html}</td></tr>\n'
+                    f'<td>{score_html}</td>'
+                    f'<td>{be_str}</td></tr>\n'
                 )
             html += "    </table>\n"
         else:

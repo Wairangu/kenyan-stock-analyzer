@@ -98,7 +98,7 @@ def _upload_prices(fundamentals_data, bucket, logger):
     return len(prices)
 
 
-def _upload_recommendations(candidates, track_record, bucket, logger):
+def _upload_recommendations(candidates, track_record, bucket, logger, hold_candidates=None):
     """
     Publish the ranked candidate list + track record (already computed
     once, earlier in handler() -- see the signal_history/track_record
@@ -115,6 +115,7 @@ def _upload_recommendations(candidates, track_record, bucket, logger):
         "valid_until": recommendation_expiry(session),
         "strategy_version": STRATEGY_VERSION,
         "candidates": candidates,
+        "hold_candidates": hold_candidates or [],
         "track_record": track_record,
     }
     boto3.client('s3').put_object(
@@ -194,7 +195,9 @@ def handler(event, context):
     sector_analyzer = SectorAnalyzer()
 
     logger.info("Fetching stock data...")
-    stock_data = data_acq.fetch_all_stocks(period='6mo', interval='1d')
+    # 12-1 momentum needs ~13 months of bars; a 6-month window silently
+    # drops the factor for every name.
+    stock_data = data_acq.fetch_all_stocks(period='2y', interval='1d')
     if not stock_data:
         raise RuntimeError("No stock data fetched — aborting.")
     logger.info(f"Fetched {len(stock_data)} stocks")
@@ -269,12 +272,17 @@ def handler(event, context):
     alerts = {}
     if config.enable_scoring:
         try:
-            from scoring import score_stock, generate_alerts
+            # One universe-wide pass: percentile ranks only mean something
+            # when every name is ranked against the same cross-section on the
+            # same date.
+            from scoring import score_universe, generate_alerts
+            scores = score_universe(analysis_results, fundamentals_data,
+                                    sector_medians=sector_medians,
+                                    validations=validations)
             for symbol, result in analysis_results.items():
                 if not result:
                     continue
                 fund = fundamentals_data.get(symbol, {})
-                scores[symbol] = score_stock(symbol, result, fund, sector_medians=sector_medians)
                 a = generate_alerts(symbol, result, fund, validations.get(symbol))
                 if a:
                     alerts[symbol] = a
@@ -282,10 +290,19 @@ def handler(event, context):
             logger.warning(f"Scoring skipped: {e}")
 
     candidates = []
+    hold_candidates = []
     try:
         from recommender import screen_with_alerts
         candidates = screen_with_alerts(analysis_results, fundamentals_data, scores, validations, alerts)
         logger.info(f"Recommender: {len(candidates)} buy-worthy candidate(s) today")
+        # The retention list: every name evaluated as though it were already
+        # held, so the portfolio app can apply the hold threshold to whatever
+        # its user actually owns. The analyzer never sees anyone's holdings.
+        from recommender import build_candidate_list
+        hold_candidates = build_candidate_list(
+            analysis_results, fundamentals_data, scores, validations=validations,
+            holdings=set(analysis_results),
+        )
     except Exception as e:
         logger.warning(f"Candidate ranking skipped: {e}")
 
@@ -294,7 +311,7 @@ def handler(event, context):
     # here, once, so both the email and recommendations.json use the exact
     # same numbers. No S3 to read/write in a dry run, so the track record
     # is just correctly empty then (see track_record.compute_track_record).
-    track_record = {"horizon_days": 10, "as_of": None, "tiers": {}, "note": "No signal history yet."}
+    track_record = {"horizon_days": 60, "as_of": None, "tiers": {}, "note": "No signal history yet."}
     # Track Record page: the literal tv_class signal above, but at several
     # horizons and all five tiers (not just strong_buy/buy) so the page can
     # show the full bullish-to-bearish spread; plus a *different*, older
@@ -302,13 +319,16 @@ def handler(event, context):
     # from ~7 weeks of already-archived market_summary_*.html reports --
     # see src/report_archive.py for why: it's a real, immediately usable
     # sample while the tv_class history above is still brand new.
-    TRACK_RECORD_HORIZONS = (5, 10, 20)
+    TRACK_RECORD_HORIZONS = (20, 60, 120)
     track_record_new = {}
     track_record_legacy = {}
+    ic_decay = {}
+    ic_archive = {}
     if not dry_run:
         try:
             import signal_history
             from track_record import compute_track_record
+            from information_coefficient import compute_ic_decay, snapshots_from_archive
             s3_history = boto3.client('s3')
             bucket_for_history = os.environ['S3_BUCKET']
             signal_history.write_daily_snapshot(
@@ -317,11 +337,20 @@ def handler(event, context):
             )
             snapshots = signal_history.load_all_snapshots(s3_history, bucket_for_history)
             track_record = compute_track_record(snapshots)
+            # The cross-sectional read: far more observations per session than
+            # the portfolio tables, so it is the measurement that can reach
+            # significance on a live NSE sample.
+            ic_decay = compute_ic_decay(snapshots)
 
             import report_archive
             legacy_snapshots = report_archive.fetch_market_summary_snapshots(
                 s3_history, bucket_for_history,
             )
+            # Mined prices never passed the live cross-check and these reports
+            # carry no factor score, so this is opt-in and labelled as a
+            # diagnostic on the older signal -- never the current screen.
+            ic_archive = compute_ic_decay(snapshots_from_archive(legacy_snapshots),
+                                          verified_only=False)
             for h in TRACK_RECORD_HORIZONS:
                 track_record_new[h] = compute_track_record(
                     snapshots, tier_field='tv_class',
@@ -348,6 +377,7 @@ def handler(event, context):
         validations=validations, scores=scores, alerts=alerts, usd_kes=usd_kes,
         bonds=bonds, cbk_auctions=cbk_auctions,
         track_record_legacy=track_record_legacy, track_record_new=track_record_new,
+        ic_decay=ic_decay, ic_archive=ic_archive,
     )
 
     notifier = EmailNotifier(config)  # only generate_email_body() is used — SMTP fields are unused here
@@ -376,7 +406,8 @@ def handler(event, context):
         result["prices_symbols"] = _upload_prices(fundamentals_data, bucket, logger)
 
         try:
-            _upload_recommendations(candidates, track_record, bucket, logger)
+            _upload_recommendations(candidates, track_record, bucket, logger,
+                                    hold_candidates=hold_candidates)
         except Exception as e:
             logger.warning(f"Recommendations publish skipped: {e}")
 

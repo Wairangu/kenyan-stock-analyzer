@@ -9,6 +9,8 @@ A daily stock screening pipeline for the **Nairobi Securities Exchange (NSE)**. 
 - **All 57 NSE stocks** analyzed daily — not just a watchlist
 - **Fundamental analysis** — P/E, PEG, ROE, ROIC, operating/net margins, debt ratios, revenue/EPS growth, market cap, and more
 - **Technical analysis** — RSI, MACD, Bollinger Bands, SMA/EMA crossovers, Stochastic, ATR, OBV, support/resistance levels
+- **Cross-sectional factor screen** — every metric ranked against the same day's universe, momentum measured at 12-1, and the round-trip cost published beside each candidate
+- **Information coefficient tracking** — rank correlation between score and forward return across the whole eligible universe, at several horizons, so the screen can be measured in years rather than decades
 - **6 charts per stock** — price+SMA+Bollinger, RSI, MACD, volume, stochastic, ATR
 - **Plain-English explanations** — every metric explained in simple terms (e.g. "RSI above 70 = overbought, price may pull back")
 - **Similar stocks** — peer comparison by sector, market cap, and valuation
@@ -73,7 +75,7 @@ python main.py                    # All stocks, 6-month data, HTML only
 python main.py --detailed         # Generate individual stock reports (57 files)
 python main.py --export-excel     # Also export Excel workbook
 python main.py --report-type both # Generate HTML + PDF (requires WeasyPrint)
-python main.py --period 1y        # Use 1 year of historical data
+python main.py --period 1y        # 1 year of data (default 2y; 12-1 momentum needs ~13 months)
 python main.py --force-refresh    # Skip cache, fetch fresh data
 python main.py --watchlist-only   # Only analyze configured watchlist (10 stocks)
 ```

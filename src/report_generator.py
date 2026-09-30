@@ -951,7 +951,7 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
                        report_files=None, fundamentals_data=None,
                        validations=None, scores=None, alerts=None, usd_kes=None,
                        bonds=None, cbk_auctions=None, track_record_legacy=None,
-                       track_record_new=None):
+                       track_record_new=None, ic_decay=None, ic_archive=None):
         """
         Generate the main index.html dashboard — the single entry point.
 
@@ -1067,7 +1067,8 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
             bearish=bearish, neutral=neutral, total=len(stocks),
             data_date=data_date, alerts=alerts, usd_kes=usd_kes, bonds=bonds,
             cbk_auctions=cbk_auctions, track_record_legacy=track_record_legacy,
-            track_record_new=track_record_new,
+            track_record_new=track_record_new, ic_decay=ic_decay,
+            ic_archive=ic_archive,
         )
         return index_path
 
@@ -2338,7 +2339,8 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
                 'These are heuristics, not rules — every situation has exceptions.</p>'
                 f'<div class="explain-grid">{items}</div></div>')
 
-    def _build_track_record_body(self, track_record_legacy=None, track_record_new=None):
+    def _build_track_record_body(self, track_record_legacy=None, track_record_new=None,
+                                 ic_decay=None, ic_archive=None):
         """
         Build the Track Record page: did the system's past calls actually
         work? Two different signals are measured, each against its own
@@ -2421,19 +2423,96 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             '2026-09-21',
         )
 
+        def _ic_section(by_horizon, title=None, intro=None, provenance=None):
+            """Does a higher score predict a higher forward return?
+
+            The portfolio tables above collapse each period into one number, so
+            they accumulate evidence at a few observations a year. This uses the
+            whole eligible cross-section on every date instead, which is the
+            only way a live NSE sample reaches significance this decade -- see
+            docs/strategy.md. An IC is a rank correlation, never a return.
+            """
+            heading = title or '🔬 Score vs. outcome (information coefficient)'
+            if not by_horizon:
+                return (f'<div class="section"><h2>{heading}</h2>'
+                        '<p class="dq-note">Not available on this run.</p></div>')
+            rows = ''
+            for h in sorted(by_horizon.keys()):
+                result = by_horizon[h] or {}
+                ind = result.get('independent') or {}
+                over = result.get('overlapping') or {}
+                mean = ind.get('mean_ic')
+                years = ind.get('years_to_significance')
+                rows += (
+                    f'<tr><td>{h} trading days</td>'
+                    f'<td>{ind.get("n", 0)}</td>'
+                    f'<td>{f"{mean:+.3f}" if mean is not None else "—"}</td>'
+                    f'<td>{ind.get("t_stat") if ind.get("t_stat") is not None else "—"}</td>'
+                    f'<td>{f"{years:g} yrs" if years is not None else "—"}</td>'
+                    f'<td>{over.get("n", 0)}</td></tr>'
+                )
+            horizons = sorted(by_horizon.keys())
+            first = by_horizon[horizons[0]] or {}
+            # A grid of dashes explains nothing. Say why it is empty, and what
+            # has to happen before the first number can exist.
+            empty = all((by_horizon[h] or {}).get('overlapping', {}).get('n', 0) == 0
+                        for h in horizons)
+            pending = ''
+            if empty:
+                need = ', '.join(f'{h + 1} for the {h}-session read' for h in horizons)
+                pending = (
+                    '<p class="dq-note"><strong>No completed periods yet.</strong> '
+                    'Each observation needs a decision date plus the whole holding '
+                    f'window to have passed: {need}. Snapshots accumulate one per '
+                    'session, so the table fills in from the shortest horizon first.</p>'
+                )
+            body_intro = intro or (
+                'Rank correlation between the score on the day and the '
+                'price change over the following sessions, across every eligible name rather than '
+                'the five that were bought. Reading across horizons shows where the signal lives: '
+                'flat at 5 days and rising at 60 means a slow factor, the reverse means the trading '
+                'horizon is wrong. This is not a return and not a profit.')
+            warning = (f'<p class="dq-note"><strong>{_esc(provenance)}</strong></p>'
+                       if provenance else '')
+            return (
+                f'<div class="section"><h2>{heading}</h2>'
+                f'<p class="page-intro">{body_intro}</p>'
+                f'{warning}{pending}'
+                '<div class="table-wrap"><table><thead><tr>'
+                '<th>Horizon</th><th title="Non-overlapping periods">Independent obs.</th>'
+                '<th>Mean IC</th><th>t</th>'
+                '<th title="Indicative projection from the dispersion observed so far">'
+                'Projected time to significance</th>'
+                '<th title="Sampled every session; autocorrelated, shown for the trend only">'
+                'Overlapping obs.</th>'
+                f'</tr></thead><tbody>{rows}</tbody></table></div>'
+                f'<p class="dq-note">{_esc(first.get("note", ""))}</p></div>'
+            )
+
         return (
             '<p class="page-intro">Prospective model results and separate historical signal diagnostics. '
             'These are price returns, excluding dividends and corporate actions. The benchmark is an '
             'equal-weight investable universe on matching dates, not an NSE index. '
             'A small sample cannot establish predictive skill.</p>'
-            + legacy_section + new_section
+            + legacy_section + new_section + _ic_section(ic_decay or {})
+            + _ic_section(
+                ic_archive or {},
+                title='🗄️ Archived technical signal — did it order returns?',
+                intro='The same rank-correlation measure applied to the archived market '
+                      'summaries: the locally computed bullish/bearish call against the price '
+                      'change that followed. Those reports carry no factor score, so this '
+                      'measures that older signal, not the current screen.',
+                provenance='Mined history. Prices here never passed the independent '
+                           'cross-check the live screen requires, and the current screen\'s '
+                           'score cannot be recovered for these dates without look-ahead. '
+                           'Diagnostic only.')
         )
 
     def _build_dashboard_pages(self, stocks, gainers, losers, sectors, breadth,
                                sector_chart, bullish, bearish, neutral, total,
                                data_date=None, alerts=None, usd_kes=None, bonds=None,
                                cbk_auctions=None, track_record_legacy=None,
-                               track_record_new=None):
+                               track_record_new=None, ic_decay=None, ic_archive=None):
         """
         Build the multi-page dashboard: a clean Overview plus grouped detail
         pages (Technicals, Fundamentals, Dividends, Sectors, Data Quality).
@@ -2848,7 +2927,8 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
         )
 
         # ---- TRACK RECORD page (did past calls actually work?) ----
-        track_record_body = self._build_track_record_body(track_record_legacy, track_record_new)
+        track_record_body = self._build_track_record_body(track_record_legacy, track_record_new,
+                                                          ic_decay=ic_decay, ic_archive=ic_archive)
 
         # ---- Assemble & write all pages ----
         pages = {

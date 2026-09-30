@@ -6,6 +6,7 @@ Indicators: SMA, EMA, RSI (Wilder), MACD, Bollinger Bands,
             Support/Resistance levels.
 
 Signals: Crossover detection (not just state), market breadth.
+Factors:  12-1 momentum (12-month return excluding the latest month).
 """
 
 import pandas as pd
@@ -16,6 +17,11 @@ from logger import get_logger
 from utils import detect_support_resistance
 
 logger = get_logger(__name__)
+
+# The documented momentum effect is the 12-month return measured to one
+# month ago; the skipped month is where short-horizon reversal lives.
+MOMENTUM_LOOKBACK_BARS = 252
+MOMENTUM_SKIP_BARS = 21
 
 
 class AnalysisEngine:
@@ -338,8 +344,27 @@ class AnalysisEngine:
             'history_date': history_date,
             'history_complete': len(df) >= max(self.sma_long, self.macd_slow + self.macd_signal_period),
             'median_value_traded_20d': traded_value,
+            'momentum_12_1': self.calculate_momentum_12_1(df['close']),
             'identity_verified': bool(data.attrs.get('identity_verified', False)),
         }
+
+    @staticmethod
+    def calculate_momentum_12_1(close):
+        """
+        12-month return excluding the most recent month, in percent.
+
+        Returns None unless the full window is available: a partial window
+        would silently become a different, shorter-horizon factor rather than
+        the one the screen intends to measure.
+        """
+        needed = MOMENTUM_LOOKBACK_BARS + 1
+        if close is None or len(close) < needed:
+            return None
+        start = close.iloc[-needed]
+        end = close.iloc[-(MOMENTUM_SKIP_BARS + 1)]
+        if not np.isfinite(start) or not np.isfinite(end) or start <= 0:
+            return None
+        return float((end / start - 1) * 100)
 
     def _generate_signals(self, df):
         """Generate trading signals with crossover detection."""
@@ -436,17 +461,26 @@ class AnalysisEngine:
         else:
             signals['volume'] = 'undefined'
 
-        # 8. Overall summary signal
-        bullish_count = sum(
-            1 for s in [
-                signals['ma_crossover'], signals['macd'], signals['trend']
-            ] if 'bullish' in str(s) or 'golden' in str(s)
-        )
-        bearish_count = sum(
-            1 for s in [
-                signals['ma_crossover'], signals['macd'], signals['trend']
-            ] if 'bearish' in str(s) or 'death' in str(s)
-        )
+        # 8. Overall summary signal.
+        # `ma_crossover` and `trend` both read price against a moving average,
+        # so they are one piece of information and get one vote between them.
+        # Counting them separately let a single input outvote MACD 2-1 every
+        # time, which made the summary a restatement of the trend, not a vote.
+        def vote(state):
+            text = str(state)
+            if 'bullish' in text or 'golden' in text:
+                return 1
+            if 'bearish' in text or 'death' in text:
+                return -1
+            return 0
+
+        moving_average = vote(signals['ma_crossover']) + vote(signals['trend'])
+        votes = [
+            (1 if moving_average > 0 else -1 if moving_average < 0 else 0),
+            vote(signals['macd']),
+        ]
+        bullish_count = sum(1 for v in votes if v > 0)
+        bearish_count = sum(1 for v in votes if v < 0)
         if not self._get_latest_values(df).get('sma_50'):
             signals['overall'] = 'undefined'
         elif bullish_count > bearish_count:

@@ -6,18 +6,19 @@ total returns: these diagnostics explicitly exclude dividends/corporate actions.
 """
 
 from datetime import timedelta
-from data_quality import finite_number, parse_date, is_session
+from data_quality import finite_number, parse_date, is_session, next_session
+from recommender import round_trip_breakeven_pct, DEFAULT_FEE_PCT
 
 DEFAULT_TIER_FIELD = "tv_class"
 DEFAULT_TIERS = ("strong_buy", "buy")
+# A 1.5%-per-side round trip costs ~3.2%, so a 5- or 10-session horizon
+# asks the signal for ~100%/year just to cover friction. The default
+# holding period is set to where that hurdle is plausibly clearable.
+DEFAULT_HORIZON_DAYS = 60
 
 
 def _next_session(day, steps=1):
-    for _ in range(steps):
-        day += timedelta(days=1)
-        while not is_session(day):
-            day += timedelta(days=1)
-    return day.isoformat()
+    return next_session(day, steps).isoformat()
 
 
 def _summary(returns):
@@ -27,7 +28,7 @@ def _summary(returns):
 
 
 def compute_track_record(snapshots_by_date, tier_field=DEFAULT_TIER_FIELD,
-                         tiers=DEFAULT_TIERS, horizon_days=10, *,
+                         tiers=DEFAULT_TIERS, horizon_days=DEFAULT_HORIZON_DAYS, *,
                          selected_only=True, slippage_pct=0.001):
     """Evaluate non-overlapping decisions at next-session close, after costs.
 
@@ -47,6 +48,7 @@ def compute_track_record(snapshots_by_date, tier_field=DEFAULT_TIER_FIELD,
     periods = []
     missing_periods = 0
     last_exit = None
+    fee_used = None
     for signal_date in dates:
         if selected_only and last_exit and signal_date < last_exit:
             continue
@@ -83,6 +85,7 @@ def compute_track_record(snapshots_by_date, tier_field=DEFAULT_TIER_FIELD,
         if selected_only and (budget is None or budget <= 0 or fee is None or not 0 <= fee < 1):
             missing_periods += 1
             continue
+        fee_used = fee
         cash = budget or 0.0
         proceeds = 0.0
         bought = []
@@ -128,14 +131,20 @@ def compute_track_record(snapshots_by_date, tier_field=DEFAULT_TIER_FIELD,
     model = _summary([p["return_pct"] for p in periods])
     model["periods"] = periods
     model["incomplete_periods"] = missing_periods
+    # The hurdle every horizon has to clear, from the costs actually recorded
+    # in the snapshots (falling back to the policy default before any period
+    # has been evaluated). Legacy diagnostics are gross, so their hurdle is 0.
+    cost_fee = (fee_used if fee_used is not None else DEFAULT_FEE_PCT) if selected_only else 0.0
+    breakeven = round_trip_breakeven_pct(cost_fee, slip if selected_only else 0.0)
     mode = "Screened model portfolio" if selected_only else "Legacy signal diagnostic (overlapping observations)"
     note = (f"{mode}. Next-session close entry; {horizon_days} NSE sessions held. "
             + ("Includes recorded fees and assumed " + str(slip * 100) + "% slippage per side. "
                if selected_only else "Gross price changes, excluding trading costs. ")
+            + f"A round trip costs {breakeven:.2f}%, which the holding period must clear. "
             + "Price returns only: dividends and corporate actions are not available. "
             + "Sample counts do not establish statistical confidence. "
             + f"{missing_periods} completed period(s) excluded for missing data.")
     return {"horizon_days": horizon_days, "as_of": dates[-1] if dates else None,
             "tiers": {tier: _summary(values) for tier, values in returns.items()},
             "benchmark": _summary(benchmark), "portfolio": model,
-            "selected_only": selected_only, "note": note}
+            "breakeven_pct": breakeven, "selected_only": selected_only, "note": note}

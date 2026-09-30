@@ -54,8 +54,13 @@ def main():
         description='Kenyan Stock Analyzer — NSE Daily Dashboard'
     )
     parser.add_argument('--date', type=str, help='Analysis date (YYYY-MM-DD)')
-    parser.add_argument('--period', type=str, default='6mo',
-                        help='Data period: 1d, 5d, 1mo, 3mo, 6mo, 1y')
+    parser.add_argument('--archive-bucket', metavar='S3_BUCKET', default=None,
+                        help='Also measure the archived market_summary reports in this '
+                             'S3 bucket on the Track Record page. Diagnostic on the older '
+                             'signal with unverified prices, not the current screen.')
+    parser.add_argument('--period', type=str, default='2y',
+                        help='Data period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y. '
+                             '12-1 momentum needs at least ~13 months.')
     parser.add_argument('--interval', type=str, default='1d',
                         help='Data interval')
     parser.add_argument('--report-type', type=str, choices=['html', 'pdf', 'both'],
@@ -215,12 +220,17 @@ def main():
         if config.enable_scoring:
             logger.info("Scoring stocks (transparent factor screen)...")
             try:
-                from scoring import score_stock, generate_alerts
+                # One universe-wide pass: percentile ranks only mean
+                # something when every name is ranked against the same
+                # cross-section on the same date.
+                from scoring import score_universe, generate_alerts
+                scores = score_universe(analysis_results, fundamentals_data,
+                                        sector_medians=sector_medians,
+                                        validations=validations)
                 for symbol, result in analysis_results.items():
                     if not result:
                         continue
                     fund = fundamentals_data.get(symbol, {})
-                    scores[symbol] = score_stock(symbol, result, fund, sector_medians=sector_medians)
                     a = generate_alerts(symbol, result, fund, validations.get(symbol))
                     if a:
                         alerts[symbol] = a
@@ -229,18 +239,35 @@ def main():
 
         from recommender import screen_with_alerts
         candidates = screen_with_alerts(analysis_results, fundamentals_data, scores, validations, alerts)
+        TRACK_RECORD_HORIZONS = (20, 60, 120)
         track_record = {"tiers": {}, "note": "No version-2 decision history yet."}
         track_record_new = {}
+        ic_decay = {}
+        ic_archive = {}
         if config.enable_history:
             try:
                 from signal_history import write_local_snapshot, load_local_snapshots
-                from track_record import compute_track_record
+                from track_record import compute_track_record, DEFAULT_HORIZON_DAYS
+                from information_coefficient import compute_ic_decay
                 history_dir = os.path.join(config.cache_dir, 'history')
                 write_local_snapshot(history_dir, analysis_results, fundamentals_data, scores,
                                      candidates=candidates, validations=validations)
                 snapshots = load_local_snapshots(history_dir)
-                track_record_new = {h: compute_track_record(snapshots, horizon_days=h) for h in (5, 10, 20)}
-                track_record = track_record_new[10]
+                track_record_new = {h: compute_track_record(snapshots, horizon_days=h)
+                                    for h in TRACK_RECORD_HORIZONS}
+                track_record = track_record_new[DEFAULT_HORIZON_DAYS]
+                # The cross-sectional read: far more observations per session
+                # than the portfolio tables, so it is the measurement that can
+                # reach significance on a live NSE sample.
+                ic_decay = compute_ic_decay(snapshots)
+                if args.archive_bucket:
+                    import boto3
+                    from report_archive import fetch_market_summary_snapshots
+                    from information_coefficient import snapshots_from_archive
+                    mined = fetch_market_summary_snapshots(boto3.client('s3'),
+                                                           args.archive_bucket)
+                    ic_archive = compute_ic_decay(snapshots_from_archive(mined),
+                                                  verified_only=False)
             except Exception as e:
                 logger.warning(f"Model snapshot/track record skipped: {e}")
 
@@ -310,6 +337,8 @@ def main():
             bonds=bonds,
             cbk_auctions=cbk_auctions,
             track_record_new=track_record_new,
+            ic_decay=ic_decay,
+            ic_archive=ic_archive,
         )
 
         # ---- Email ----
