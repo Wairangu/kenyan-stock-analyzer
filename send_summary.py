@@ -33,38 +33,11 @@ from analysis_engine import AnalysisEngine
 from fundamental_analysis import FundamentalAnalysis
 from report_generator import ReportGenerator
 from sector_analysis import SectorAnalyzer
+from utils import market_closed_today
 
 config = Config()
 setup_logging(config)
 logger = get_logger(__name__)
-
-
-def market_closed_today():
-    """
-    Return (closed: bool, reason: str|None) for the NSE today, evaluated in
-    Nairobi time. The NSE does not trade on weekends or Kenyan public
-    holidays (New Year, Easter, Labour Day, Madaraka, Mashujaa, Jamhuri,
-    Christmas, Boxing Day, Eid, etc.).
-    """
-    try:
-        from zoneinfo import ZoneInfo
-        today = datetime.now(ZoneInfo("Africa/Nairobi")).date()
-    except Exception:
-        today = datetime.now().date()
-
-    if today.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
-        return True, "weekend"
-
-    try:
-        import holidays
-        ke = holidays.Kenya(years=today.year)
-        if today in ke:
-            return True, ke.get(today)
-    except Exception as e:
-        # If the holiday check is unavailable, don't block the report.
-        logger.warning(f"Holiday check unavailable ({e}); proceeding anyway.")
-
-    return False, None
 
 
 def main():

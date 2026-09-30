@@ -1086,6 +1086,19 @@ ul {{ margin: 4px 0; padding-left: 18px; }} li {{ margin: 2px 0; }}
         ('track_record.html', '🎯 Track Record'),
     ]
 
+    # Inline SVG favicon — an ascending green bar chart on a dark tile (a
+    # "graph"). Self-contained data URI, so no external file is needed.
+    _FAVICON = (
+        "<link rel=\"icon\" href=\"data:image/svg+xml,"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+        "<rect width='32' height='32' rx='7' fill='%230f172a'/>"
+        "<rect x='6' y='17' width='5' height='9' rx='1.2' fill='%2322c55e'/>"
+        "<rect x='13.5' y='11' width='5' height='15' rx='1.2' fill='%2338bd7a'/>"
+        "<rect x='21' y='6' width='5' height='20' rx='1.2' fill='%234ade80'/>"
+        "<path d='M7 15.5 L16 10 L25 5.5' fill='none' stroke='%23bbf7d0' "
+        "stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/>"
+        "</svg>\">")
+
     def _dashboard_css(self):
         """Shared stylesheet for all dashboard pages (plain string)."""
         return """<style>
@@ -1329,6 +1342,11 @@ th {
   top: 0;
   z-index: 1;
 }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--blue); }
+th.sortable::after { content: '⇅'; opacity: 0.3; margin-left: 4px; }
+th.sortable.sort-asc::after { content: '▲'; opacity: 0.85; color: var(--blue); }
+th.sortable.sort-desc::after { content: '▼'; opacity: 0.85; color: var(--blue); }
 tbody tr { transition: background 140ms ease; }
 tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
 .stock-link { color: var(--blue); text-decoration: none; font-weight: 800; }
@@ -1583,13 +1601,35 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             f'<a href="{fn}" class="nav-item{" active" if fn == active_file else ""}">{lbl}</a>'
             for fn, lbl in self._NAV
         )
-        js = ("<script>function filterTable(){var i=document.getElementById('search');"
-              "var q=i?i.value.toLowerCase():'';var rows=document.querySelectorAll('#mainTable tbody tr');"
-              "rows.forEach(function(r){r.style.display=(!q||r.textContent.toLowerCase().indexOf(q)>-1)?'':'none';});}</script>"
-              ) if with_filter else ""
+        filter_js = ("function filterTable(){var i=document.getElementById('search');"
+                     "var q=i?i.value.toLowerCase():'';var rows=document.querySelectorAll('#mainTable tbody tr');"
+                     "rows.forEach(function(r){r.style.display=(!q||r.textContent.toLowerCase().indexOf(q)>-1)?'':'none';});}"
+                     ) if with_filter else ""
+        # Click-to-sort for tables (asc/desc toggle). Reorders rows only —
+        # never touches the values. Numeric, text and signal-rank columns.
+        sort_js = (
+            "function scv(cell,type){if(!cell)return type==='number'?-Infinity:'';"
+            "var t=(cell.textContent||'').trim();"
+            "if(type==='signal'){var m={'strong buy':5,'buy':4,'neutral':3,'hold':3,'sell':2,'strong sell':1};"
+            "return m[t.toLowerCase()]!==undefined?m[t.toLowerCase()]:0;}"
+            "if(type==='number'){var n=parseFloat(t.replace(/[^0-9.-]/g,''));return isNaN(n)?-Infinity:n;}"
+            "if(type==='text')return t.toLowerCase();"
+            "var a=parseFloat(t.replace(/[^0-9.-]/g,''));return isNaN(a)?t.toLowerCase():a;}"
+            "function sortTable(th){var tbl=th.closest('table'),tb=tbl.tBodies[0];"
+            "var idx=Array.prototype.indexOf.call(th.parentNode.children,th);"
+            "var type=th.getAttribute('data-sort-type')||'auto';"
+            "var asc=th.getAttribute('data-asc')!=='1';var hs=th.parentNode.children;"
+            "for(var i=0;i<hs.length;i++){hs[i].removeAttribute('data-asc');hs[i].classList.remove('sort-asc','sort-desc');}"
+            "th.setAttribute('data-asc',asc?'1':'0');th.classList.add(asc?'sort-asc':'sort-desc');"
+            "var rows=Array.prototype.slice.call(tb.rows);"
+            "rows.sort(function(a,b){var x=scv(a.cells[idx],type),y=scv(b.cells[idx],type);"
+            "if(x<y)return asc?-1:1;if(x>y)return asc?1:-1;return 0;});"
+            "rows.forEach(function(r){tb.appendChild(r);});}")
+        js = f"<script>{filter_js}{sort_js}</script>"
         return (
             '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+            + self._FAVICON +
             f'<title>{page_title}</title>' + self._dashboard_css() + '</head><body>'
             '<div class="container">'
             f'<div class="header"><h1>🇰🇪 NSE Dashboard</h1><div class="date">{subtitle}</div></div>'
@@ -2491,10 +2531,16 @@ tbody tr:hover { background: rgba(37, 99, 235, 0.055); }
             'Use the tabs above for technicals, fundamentals, dividends, sectors and data quality.</p>'
             + stats_html + movers_html +
             '<div class="section"><h2>📋 All Stocks — Signal &amp; Score</h2>'
+            '<p class="page-intro"><strong>Click any column header to sort</strong> (click again to reverse).</p>'
             + search_bar +
             '<div class="table-wrap"><table id="mainTable"><thead><tr>'
-            '<th>Symbol</th><th title="TradingView Buy/Sell rating">TV Signal</th><th>Price</th>'
-            '<th>Change</th><th title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th>'
+            '<th class="sortable" data-sort-type="text" onclick="sortTable(this)">Symbol</th>'
+            '<th class="sortable" data-sort-type="signal" onclick="sortTable(this)" '
+            'title="TradingView Buy/Sell rating — sorts Strong Buy → Strong Sell">TV Signal</th>'
+            '<th class="sortable" data-sort-type="number" onclick="sortTable(this)">Price</th>'
+            '<th class="sortable" data-sort-type="number" onclick="sortTable(this)">Change</th>'
+            '<th class="sortable" data-sort-type="number" onclick="sortTable(this)" '
+            'title="0-100 factor screen. Dashed △ = fewer than 80% of factors had data">Score</th>'
             f'</tr></thead><tbody>{ov_rows}</tbody></table></div></div>')
 
         # ---- TECHNICALS page ----

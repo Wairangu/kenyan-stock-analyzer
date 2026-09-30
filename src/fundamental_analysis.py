@@ -364,7 +364,10 @@ class FundamentalAnalysis:
 
                         # === Price & Technical ===
                         "close": getattr(stock, 'close', None),
-                        "change_pct": d.get('change'),
+                        # 1-day % change. TradingView exposes this as the base
+                        # model attribute `change` (NOT model_extra), so read it
+                        # via getattr — d.get('change') is always None here.
+                        "change_pct": getattr(stock, 'change', None),
                         "rsi": d.get('RSI'),
                         "recommendation": getattr(stock, 'recommendation_mark', None),
                         # TradingView technical-rating gauge (Recommend.All),
@@ -380,6 +383,7 @@ class FundamentalAnalysis:
                         "perf_ytd": d.get('Perf.YTD'),
                         "perf_1y": d.get('Perf.Y'),
                         "perf_5y": d.get('Perf.5Y'),
+                        "perf_all": d.get('Perf.All'),
 
                         # === Volume ===
                         "volume": getattr(stock, 'volume', None),

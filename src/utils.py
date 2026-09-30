@@ -119,6 +119,37 @@ def enforce_daily_cache(data_dir, reports_dir=None):
     return is_new_day
 
 
+def market_closed_today():
+    """
+    Return (closed: bool, reason: str|None) for the NSE today, evaluated in
+    Nairobi time. The NSE does not trade on weekends or Kenyan public
+    holidays (New Year, Easter, Labour Day, Madaraka, Mashujaa, Jamhuri,
+    Christmas, Boxing Day, Eid, etc.).
+
+    Shared by send_summary.py and aws/lambda_handler.py — one implementation,
+    not two copies that could drift.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Africa/Nairobi")).date()
+    except Exception:
+        today = datetime.now().date()
+
+    if today.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        return True, "weekend"
+
+    try:
+        import holidays
+        ke = holidays.Kenya(years=today.year)
+        if today in ke:
+            return True, ke.get(today)
+    except Exception as e:
+        # If the holiday check is unavailable, don't block the report.
+        logger.warning(f"Holiday check unavailable ({e}); proceeding anyway.")
+
+    return False, None
+
+
 def retry(max_attempts=3, backoff=2, exceptions=(Exception,)):
     """
     Decorator that retries a function on failure with exponential backoff.

@@ -47,37 +47,12 @@ from report_generator import ReportGenerator
 from sector_analysis import SectorAnalyzer
 from fundamental_analysis import FundamentalAnalysis
 from email_notifier import EmailNotifier
+from utils import market_closed_today
 
 CONTENT_TYPES = {
     '.html': 'text/html',
     '.ics': 'text/calendar',
 }
-
-
-def _market_closed_today():
-    """
-    Same weekday + Kenyan-holiday check as send_summary.py's
-    market_closed_today(), duplicated here (rather than imported) so this
-    module has no dependency on send_summary.py's own module-level setup.
-    """
-    try:
-        from zoneinfo import ZoneInfo
-        today = datetime.now(ZoneInfo("Africa/Nairobi")).date()
-    except Exception:
-        today = datetime.now().date()
-
-    if today.weekday() >= 5:  # Saturday, Sunday
-        return True, "weekend"
-
-    try:
-        import holidays
-        ke = holidays.Kenya(years=today.year)
-        if today in ke:
-            return True, ke.get(today)
-    except Exception:
-        pass  # fail open — don't block the report on a holiday-check error
-
-    return False, None
 
 
 def _upload_reports(report_directory, bucket, logger):
@@ -194,7 +169,7 @@ def handler(event, context):
 
     dry_run = os.environ.get('DRY_RUN', 'false').lower() == 'true'
 
-    closed, reason = _market_closed_today()
+    closed, reason = market_closed_today()
     if closed:
         logger.info(f"NSE is closed today ({reason}) — skipping run.")
         return {"status": "skipped", "reason": reason}
